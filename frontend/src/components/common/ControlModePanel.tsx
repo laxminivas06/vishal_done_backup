@@ -190,7 +190,7 @@ export const ControlModePanel: React.FC<ControlModePanelProps> = ({
                   <input
                     type="checkbox"
                     checked={forceBenchArmActive}
-                    onChange={(e) => setForceBenchArmActive(e.target.checked)}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setForceBenchArmActive(e.target.checked)}
                     className="w-3.5 h-3.5 rounded border-slate-700 text-amber-500 focus:ring-amber-500/40 bg-slate-900"
                   />
                   <span className={forceBenchArmActive ? 'text-amber-300 font-bold' : 'text-slate-400'}>
