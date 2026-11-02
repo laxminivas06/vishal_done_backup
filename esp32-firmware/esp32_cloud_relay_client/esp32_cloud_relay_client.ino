@@ -54,10 +54,10 @@ const char* FALLBACK_PASS = "";
 // =====================================================================================
 // 2. CLOUD RELAY WSS CONFIGURATION (ACTIVE PRODUCTION RELAY)
 // =====================================================================================
-const char* RELAY_HOST    = "seasphndrone-backend.onrender.com";
+const char* RELAY_HOST    = "vishal-done-backup.onrender.com";
 const uint16_t RELAY_PORT = 443;
 const char* RELAY_PATH    = "/connector?token=saeindia_sec_99348a7b1c0e";
-const char* RELAY_WSS_URL = "wss://seasphndrone-backend.onrender.com/connector?token=saeindia_sec_99348a7b1c0e";
+const char* RELAY_WSS_URL = "wss://vishal-done-backup.onrender.com/connector?token=saeindia_sec_99348a7b1c0e";
 const char* RELAY_TOKEN   = "saeindia_sec_99348a7b1c0e";
 
 // Combined Root CA Certificate Bundle trusted by Render.com & Cloudflare:

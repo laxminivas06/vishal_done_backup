@@ -595,7 +595,7 @@ const heartbeatInterval = setInterval(() => {
 heartbeatInterval.unref();
 
 // Anti-Sleep Self-Ping (Keeps Render free-tier container active and prevents cold-start spin-down delays)
-const PING_TARGET_URL = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL || 'https://seasphndrone-backend.onrender.com';
+const PING_TARGET_URL = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL || 'https://vishal-done-backup.onrender.com';
 if (PING_TARGET_URL && !process.env.DISABLE_KEEP_ALIVE) {
   const keepAliveInterval = setInterval(() => {
     try {
