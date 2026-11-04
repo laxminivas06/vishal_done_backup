@@ -4,7 +4,6 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
-import { parse } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,11 +36,30 @@ const MIME_TYPES = {
 };
 
 const PORT = process.env.PORT || 8443;
-const RELAY_TOKEN = process.env.RELAY_TOKEN || 'saeindia_secret_token_2026';
+
+// Multi-token auth: accept process.env.RELAY_TOKEN, 'saeindia_sec_99348a7b1c0e', and 'saeindia_secret_token_2026'
+function getAllowedTokens() {
+  const tokens = new Set([
+    'saeindia_sec_99348a7b1c0e',
+    'saeindia_secret_token_2026'
+  ]);
+  if (process.env.RELAY_TOKEN && process.env.RELAY_TOKEN.trim()) {
+    tokens.add(process.env.RELAY_TOKEN.trim());
+  }
+  return tokens;
+}
+
+function isValidToken(token) {
+  if (!token || typeof token !== 'string') return false;
+  const clean = token.trim().replace(/^["']|["']$/g, '');
+  return getAllowedTokens().has(clean);
+}
 
 // Global relay state
 let connectorSocket = null;
 let esp32Online = false;
+let esp32Baud = 57600;
+let esp32Rssi = 0;
 let esp32LastError = '';
 const browserSockets = new Set();
 
@@ -65,9 +83,44 @@ let currentUploadJob = {
   errorMessage: null
 };
 
+// State propagation helper adhering to SAE INDIA ADDC 2026 Wire Protocol Contract
+function getRelayStatus() {
+  const isConnectorOnline = connectorSocket !== null && connectorSocket.readyState === 1;
+  return {
+    type: 'RELAY_STATUS',
+    cloud: 'CONNECTED',
+    esp32: esp32Online ? 'ONLINE' : 'OFFLINE',
+    esp32Baud: esp32Baud || 57600,
+    esp32Rssi: esp32Rssi || 0,
+    clients: browserSockets.size,
+    timestamp: Date.now(),
+    connectorOnline: isConnectorOnline,
+    esp32Online: esp32Online
+  };
+}
+
+function broadcastRelayStatus() {
+  const statusMsg = JSON.stringify(getRelayStatus());
+  for (const client of browserSockets) {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(statusMsg, noop);
+      } catch (err) {}
+    }
+  }
+}
+
 // Create HTTP server for health checks, static frontend, and WebSocket upgrades
 const server = http.createServer((req, res) => {
-  const parsedUrl = parse(req.url, true);
+  let reqUrl;
+  try {
+    reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  } catch (e) {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad Request');
+    return;
+  }
+  const pathname = reqUrl.pathname;
 
   // Universal CORS preflight
   if (req.method === 'OPTIONS') {
@@ -80,7 +133,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   
-  if (parsedUrl.pathname === '/health') {
+  if (pathname === '/health') {
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
@@ -92,6 +145,8 @@ const server = http.createServer((req, res) => {
       uptime: process.uptime(),
       connectorOnline: connectorSocket !== null && connectorSocket.readyState === WebSocket.OPEN,
       esp32Online,
+      esp32Baud,
+      esp32Rssi,
       esp32LastError,
       browserClientsCount: browserSockets.size,
       rxBytesTotal,
@@ -106,7 +161,7 @@ const server = http.createServer((req, res) => {
   }
 
   // Mission Upload Job Initiation Endpoint
-  if (parsedUrl.pathname === '/mission/upload' && req.method === 'POST') {
+  if (pathname === '/mission/upload' && req.method === 'POST') {
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
@@ -174,7 +229,7 @@ const server = http.createServer((req, res) => {
   }
 
   // Mission Status Query Endpoint
-  if (parsedUrl.pathname === '/mission/status') {
+  if (pathname === '/mission/status') {
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
@@ -185,6 +240,8 @@ const server = http.createServer((req, res) => {
       job: currentUploadJob,
       connectorOnline: connectorSocket !== null && connectorSocket.readyState === WebSocket.OPEN,
       esp32Online,
+      esp32Baud,
+      esp32Rssi,
       browserClientsCount: browserSockets.size
     }));
     return;
@@ -192,7 +249,7 @@ const server = http.createServer((req, res) => {
 
   // If frontend dist is available, serve static files (SPA fallback to index.html)
   if (DIST_PATH) {
-    let reqPath = parsedUrl.pathname || '/';
+    let reqPath = pathname || '/';
     let safePath = path.normalize(reqPath).replace(/^(\.\.[\/\\])+/, '');
     let filePath = path.join(DIST_PATH, safePath);
 
@@ -219,7 +276,7 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  if (parsedUrl.pathname === '/') {
+  if (pathname === '/') {
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*'
@@ -230,6 +287,8 @@ const server = http.createServer((req, res) => {
       uptime: process.uptime(),
       connectorOnline: connectorSocket !== null && connectorSocket.readyState === WebSocket.OPEN,
       esp32Online,
+      esp32Baud,
+      esp32Rssi,
       esp32LastError,
       browserClientsCount: browserSockets.size,
       uploadJob: currentUploadJob
@@ -250,26 +309,7 @@ const wss = new WebSocketServer({
   maxPayload: 64 * 1024
 });
 
-function broadcastStatusToBrowsers() {
-  const statusMsg = JSON.stringify({
-    type: 'RELAY_STATUS',
-    connectorOnline: connectorSocket !== null && connectorSocket.readyState === WebSocket.OPEN,
-    esp32Online: connectorSocket !== null && connectorSocket.readyState === WebSocket.OPEN && esp32Online,
-    error: connectorSocket === null 
-      ? 'ESP32 connector offline' 
-      : (!esp32Online ? (esp32LastError || 'ESP32 unavailable') : null)
-  });
-
-  for (const client of browserSockets) {
-    if (client.readyState === WebSocket.OPEN) {
-      try {
-        client.send(statusMsg, noop);
-      } catch (err) {}
-    }
-  }
-}
-
-// Upgrade handler with TCP_NODELAY optimization and token validation
+// Upgrade handler with TCP_NODELAY optimization and multi-token validation
 server.on('upgrade', (request, socket, head) => {
   // CRITICAL LOW-LATENCY OPTIMIZATION:
   // Disable Nagle's algorithm immediately on raw TCP stream.
@@ -278,33 +318,39 @@ server.on('upgrade', (request, socket, head) => {
   socket.setKeepAlive(true, 10000);
   socket.setTimeout(0);
 
-  const parsedUrl = parse(request.url, true);
-  const pathname = parsedUrl.pathname;
-  const token = parsedUrl.query.token || request.headers['x-relay-token'];
+  let reqUrl;
+  try {
+    reqUrl = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  } catch (e) {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
+  }
 
-  const allowedTokens = new Set([
-    RELAY_TOKEN ? RELAY_TOKEN.trim() : '',
-    'saeindia_secret_token_2026',
-    'saeindia_sec_99348a7b1c0e'
-  ].filter(Boolean));
+  const pathname = reqUrl.pathname;
+  const normalizedPath = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
 
-  const validateAuth = (routeLabel) => {
-    if (allowedTokens.size > 0) {
-      if (!token || !allowedTokens.has(token.trim())) {
-        const masked = token ? `${token.trim().slice(0, 3)}***` : 'none';
-        console.warn(`[AUTH FAILED] Unauthorized ${routeLabel} attempt from ${request.socket.remoteAddress} (provided: "${masked}")`);
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return false;
-      }
-    }
-    return true;
-  };
+  // Reject unknown paths with 404
+  if (normalizedPath !== '/connector' && normalizedPath !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // Multi-token auth: check ?token= query param or x-relay-token header
+  const rawToken = reqUrl.searchParams.get('token') || request.headers['x-relay-token'];
+  const token = typeof rawToken === 'string' ? rawToken.trim().replace(/^["']|["']$/g, '') : '';
+
+  if (!isValidToken(token)) {
+    const masked = token ? `${token.slice(0, 3)}***` : 'none';
+    console.warn(`[AUTH FAILED] Unauthorized ${normalizedPath} attempt from ${socket.remoteAddress} (provided: "${masked}")`);
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
 
   // Route: /connector (for ESP32 and local connector agent)
-  if (pathname === '/connector') {
-    if (!validateAuth('ESP32/connector')) return;
-
+  if (normalizedPath === '/connector') {
     wss.handleUpgrade(request, socket, head, (ws) => {
       // Re-assert TCP_NODELAY on the underlying upgraded socket
       if (ws._socket) {
@@ -316,10 +362,8 @@ server.on('upgrade', (request, socket, head) => {
     return;
   }
 
-  // Route: /ws or / (for frontend browser client)
-  if (pathname === '/ws' || pathname === '/') {
-    if (!validateAuth('browser client')) return;
-
+  // Route: /ws (for frontend browser client)
+  if (normalizedPath === '/ws') {
     wss.handleUpgrade(request, socket, head, (ws) => {
       if (ws._socket) {
         ws._socket.setNoDelay(true);
@@ -329,12 +373,9 @@ server.on('upgrade', (request, socket, head) => {
     });
     return;
   }
-
-  socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
-  socket.destroy();
 });
 
-// Lightweight MAVLink Frame Inspector for Structured Logging (Section 3 requirement)
+// Lightweight MAVLink Frame Inspector for Structured Logging
 function inspectMavlinkPacket(buf, direction) {
   if (!buf || buf.length < 8) return;
   const magic = buf[0];
@@ -453,28 +494,29 @@ function handleConnectorConnection(ws) {
   esp32LastError = '';
 
   // Notify all browsers that drone is now online
-  broadcastStatusToBrowsers();
+  broadcastRelayStatus();
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
       lastPacketTime = Date.now();
       if (!esp32Online) {
         esp32Online = true;
-        broadcastStatusToBrowsers();
+        broadcastRelayStatus();
       }
       
-      rxBytesTotal += data.length;
+      const len = data.byteLength !== undefined ? data.byteLength : (data.length || 0);
+      rxBytesTotal += len;
       packetsForwarded++;
 
       // Inspect incoming packet for mission events
       inspectMavlinkPacket(data, 'RX');
 
       // ULTRA-FAST ZERO-COPY FORWARDING:
-      // Transmit directly to all open browsers with no queuing and no compression delay
+      // Transmit directly to all open browsers with client backpressure check
       if (browserSockets.size > 0) {
         for (const browser of browserSockets) {
           if (browser.readyState === WebSocket.OPEN) {
-            // Drop packet for this specific client if client buffer is congested (>64KB)
+            // Drop packet for this specific client if client buffer is congested (>=64KB)
             // to prevent lagging behind realtime telemetry
             if (browser.bufferedAmount < 65536) {
               browser.send(data, { binary: true, mask: false }, noop);
@@ -483,18 +525,50 @@ function handleConnectorConnection(ws) {
         }
       }
     } else {
-      // JSON control message
+      // Text control message: handle QR_ALERT, ESP32_DIAG, and ESP32_STATUS
+      const text = typeof data === 'string' ? data : data.toString('utf-8');
+      let isBroadcastText = false;
+      let broadcastType = '';
       try {
-        const text = data.toString();
         const msg = JSON.parse(text);
-        if (msg.type === 'ESP32_STATUS') {
-          esp32Online = msg.status === 'CONNECTED';
+        if (msg.type === 'QR_ALERT' || msg.type === 'ESP32_DIAG') {
+          isBroadcastText = true;
+          broadcastType = msg.type;
+        } else if (msg.type === 'ESP32_STATUS') {
+          esp32Online = msg.status === 'CONNECTED' || msg.esp32Online === true;
+          if (msg.status === 'DISCONNECTED' || msg.esp32Online === false) {
+            esp32Online = false;
+          }
+          if (msg.baud !== undefined || msg.esp32Baud !== undefined) {
+            esp32Baud = Number(msg.esp32Baud !== undefined ? msg.esp32Baud : msg.baud) || 57600;
+          }
+          if (msg.rssi !== undefined || msg.esp32Rssi !== undefined) {
+            esp32Rssi = Number(msg.esp32Rssi !== undefined ? msg.esp32Rssi : msg.rssi) || 0;
+          }
           esp32LastError = msg.error || '';
-          console.log(`[CONNECTOR REPORT] ESP32 status: ${msg.status} ${esp32LastError ? `(${esp32LastError})` : ''}`);
-          broadcastStatusToBrowsers();
+          console.log(`[CONNECTOR REPORT] ESP32 status: ${esp32Online ? 'ONLINE' : 'OFFLINE'} (baud=${esp32Baud}, rssi=${esp32Rssi})`);
+          broadcastRelayStatus();
         }
       } catch (err) {
-        // Non-JSON control packet ignored
+        if (text.includes('QR_ALERT')) {
+          isBroadcastText = true;
+          broadcastType = 'QR_ALERT';
+        } else if (text.includes('ESP32_DIAG')) {
+          isBroadcastText = true;
+          broadcastType = 'ESP32_DIAG';
+        }
+      }
+
+      // Forward text frames (QR_ALERT, ESP32_DIAG) from /connector to all connected /ws browser sockets
+      if (isBroadcastText) {
+        console.log(`[${broadcastType || 'BROADCAST'}] Forwarding to ${browserSockets.size} GCS client(s): ${text.slice(0, 100)}`);
+        for (const browser of browserSockets) {
+          if (browser.readyState === WebSocket.OPEN && browser.bufferedAmount < 65536) {
+            try {
+              browser.send(text, noop);
+            } catch (e) {}
+          }
+        }
       }
     }
   });
@@ -505,7 +579,7 @@ function handleConnectorConnection(ws) {
       connectorSocket = null;
       esp32Online = false;
       esp32LastError = 'ESP32 connector offline';
-      broadcastStatusToBrowsers();
+      broadcastRelayStatus();
     }
   });
 
@@ -522,30 +596,23 @@ function handleBrowserConnection(ws) {
   browserSockets.add(ws);
   console.log(`[BROWSER] Frontend client connected (Active clients: ${browserSockets.size})`);
 
-  // Send immediate initial status
-  const initialStatus = JSON.stringify({
-    type: 'RELAY_STATUS',
-    connectorOnline: connectorSocket !== null && connectorSocket.readyState === WebSocket.OPEN,
-    esp32Online: connectorSocket !== null && connectorSocket.readyState === WebSocket.OPEN && esp32Online,
-    error: connectorSocket === null 
-      ? 'ESP32 connector offline' 
-      : (!esp32Online ? (esp32LastError || 'ESP32 unavailable') : null)
-  });
-  try {
-    ws.send(initialStatus, noop);
-  } catch (e) {}
+  // Broadcast immediate status update with updated client count to all browsers
+  broadcastRelayStatus();
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
-      txBytesTotal += data.length;
+      const len = data.byteLength !== undefined ? data.byteLength : (data.length || 0);
+      txBytesTotal += len;
       
       // Inspect outgoing packet from browser for mission events
       inspectMavlinkPacket(data, 'TX');
 
       // IMMEDIATE ZERO-DELAY COMMAND DISPATCH:
-      // Ground Station command (Guided, Takeoff, Arm, RTL, Joystick) forward directly to ESP32
+      // Ground Station command (Guided, Takeoff, Arm, RTL, Joystick) forward directly to ESP32 with backpressure check
       if (connectorSocket && connectorSocket.readyState === WebSocket.OPEN) {
-        connectorSocket.send(data, { binary: true, mask: false }, noop);
+        if (connectorSocket.bufferedAmount < 65536) {
+          connectorSocket.send(data, { binary: true, mask: false }, noop);
+        }
       }
     }
   });
@@ -553,10 +620,12 @@ function handleBrowserConnection(ws) {
   ws.on('close', () => {
     browserSockets.delete(ws);
     console.log(`[BROWSER] Frontend client disconnected (Remaining: ${browserSockets.size})`);
+    broadcastRelayStatus();
   });
 
   ws.on('error', (err) => {
     browserSockets.delete(ws);
+    broadcastRelayStatus();
   });
 }
 
@@ -569,7 +638,7 @@ const heartbeatInterval = setInterval(() => {
       connectorSocket.terminate();
       connectorSocket = null;
       esp32Online = false;
-      broadcastStatusToBrowsers();
+      broadcastRelayStatus();
     } else {
       connectorSocket.isAlive = false;
       try {
@@ -594,9 +663,9 @@ const heartbeatInterval = setInterval(() => {
 
 heartbeatInterval.unref();
 
-// Anti-Sleep Self-Ping (Keeps Render free-tier container active and prevents cold-start spin-down delays)
+// Render anti-sleep self-ping: 4-minute interval HTTP GET to /health
 const PING_TARGET_URL = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL || 'https://vishal-done-backup.onrender.com';
-if (PING_TARGET_URL && !process.env.DISABLE_KEEP_ALIVE) {
+if (!process.env.DISABLE_KEEP_ALIVE) {
   const keepAliveInterval = setInterval(() => {
     try {
       const pingUrl = new URL('/health', PING_TARGET_URL);
@@ -607,7 +676,7 @@ if (PING_TARGET_URL && !process.env.DISABLE_KEEP_ALIVE) {
         // Silently ignore ping errors
       });
     } catch (e) {}
-  }, 240000); // Every 4 minutes (Render sleep threshold is 15 minutes)
+  }, 240000); // 4-minute interval (240000 ms)
   keepAliveInterval.unref();
 }
 
@@ -617,7 +686,7 @@ server.listen(PORT, () => {
   console.log(`📡 Port:               ${PORT}`);
   console.log(`⚡ TCP_NODELAY:        ENABLED (0ms Nagle buffering delay)`);
   console.log(`🗜️  perMessageDeflate:  DISABLED (0ms zlib latency)`);
-  console.log(`🔒 Token Auth:         ${RELAY_TOKEN ? 'ENABLED' : 'DEFAULT'}`);
+  console.log(`🔒 Multi-Token Auth:   ENABLED`);
   console.log(`🌐 Browser Endpoint:   /ws`);
   console.log(`🔌 Drone Endpoint:     /connector`);
   console.log(`❤️  Health Check:       http://localhost:${PORT}/health`);

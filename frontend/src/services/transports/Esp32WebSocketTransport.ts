@@ -1,4 +1,7 @@
 import { MavlinkTransport, TransportStateEvent, TransportType } from '../../types/transport';
+import { Esp32DiagData } from '../../types/mavlink';
+
+export type { Esp32DiagData };
 
 export type WebSocketConnectionMode = 'LOCAL' | 'SECURE';
 export type WebSocketProtocolMode = 'AUTO' | 'WS' | 'WSS';
@@ -76,6 +79,12 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
   // Relay Multi-Hop Status
   private connectorOnline: boolean = false;
   private esp32Online: boolean = false;
+  private cloudState: 'CONNECTED' | 'DISCONNECTED' = 'DISCONNECTED';
+  private esp32Baud: number = 57600;
+  private esp32Rssi: number = 0;
+  private qrAlertListeners: Set<(payload: string) => void> = new Set();
+  private esp32DiagData: Esp32DiagData | null = null;
+  private esp32DiagListeners: Set<(diag: Esp32DiagData) => void> = new Set();
 
   // Link State
   private linkState: Esp32LinkState = 'DISCONNECTED';
@@ -190,6 +199,43 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
 
   public isConnectorOnline(): boolean {
     return this.connectorOnline;
+  }
+
+  public getCloudState(): 'CONNECTED' | 'DISCONNECTED' {
+    return (this.socket && this.socket.readyState === WebSocket.OPEN) ? 'CONNECTED' : 'DISCONNECTED';
+  }
+
+  public getEsp32Baud(): number {
+    return this.esp32Baud;
+  }
+
+  public getEsp32Rssi(): number {
+    return this.esp32Rssi;
+  }
+
+  public subscribeEsp32Diag(listener: (diag: Esp32DiagData) => void): () => void {
+    this.esp32DiagListeners.add(listener);
+    if (this.esp32DiagData) {
+      try {
+        listener(this.esp32DiagData);
+      } catch (e) {
+        console.error('[WS] Error in esp32Diag listener:', e);
+      }
+    }
+    return () => this.esp32DiagListeners.delete(listener);
+  }
+
+  public getEsp32Diag(): Esp32DiagData | null {
+    return this.esp32DiagData;
+  }
+
+  public subscribeQrAlert(listener: (payload: string) => void): () => void {
+    this.qrAlertListeners.add(listener);
+    return () => this.qrAlertListeners.delete(listener);
+  }
+
+  public getEsp32Online(): boolean {
+    return this.esp32Online;
   }
 
   public isEsp32Online(): boolean {
@@ -533,7 +579,7 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
    * Internal connection attempt with specific protocol ('ws' | 'wss')
    */
   private async attemptConnection(protocolToTry: 'ws' | 'wss'): Promise<boolean> {
-    const wsUrl = this.getResolvedUrl(protocolToTry);
+    let wsUrl = this.getResolvedUrl(protocolToTry);
     const isHttpsOrigin = typeof window !== 'undefined' && window.location.protocol === 'https:';
     const isLocalTarget = this.isPrivateIp(this.localHost);
 
@@ -543,67 +589,93 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
     console.log(`[WS] Resolved Endpoint = ${wsUrl}`);
     console.log(`[WS] Local Network Target = ${isLocalTarget}`);
 
-    // Check mixed-content upfront if trying ws:// on HTTPS origin
-    if (isHttpsOrigin && (wsUrl.startsWith('ws://') || this.protocolMode === 'WS')) {
-      const mixedMsg = `Browser blocks plain ws:// connections from HTTPS (${window.location.origin}). Please use SECURE mode with WSS Relay, or open Ground Station on http:// origin.`;
-      console.warn(mixedMsg);
-      this.linkState = 'ERROR';
-      this.errorCategory = 'MIXED_CONTENT_BLOCK';
-      this.lastErrorMessage = mixedMsg;
-      this.notifyState({
-        phase: 'SERIAL_OPEN_FAILED',
-        message: mixedMsg,
-        error: 'Mixed-content browser blocking'
-      });
-      return false;
+    // Mixed-Content Protection: Detect https: origin and upgrade non-local ws:// to wss:// or surface clear error
+    if (isHttpsOrigin) {
+      if (wsUrl.startsWith("ws://") || this.protocolMode === "WS") {
+        if (isLocalTarget) {
+          const mixedMsg = `Browser blocks plain ws:// connections to local network (${this.localHost}) from HTTPS (${window.location.origin}). Please use SECURE mode with WSS Relay, or open Ground Station on http:// origin.`;
+          console.warn(mixedMsg);
+          this.linkState = "ERROR";
+          this.errorCategory = "MIXED_CONTENT_BLOCK";
+          this.lastErrorMessage = mixedMsg;
+          this.notifyState({
+            phase: "SERIAL_OPEN_FAILED",
+            message: mixedMsg,
+            error: "MIXED_CONTENT_BLOCK"
+          });
+          return false;
+        } else {
+          console.log(`[WS] Mixed-content protection: Upgrading non-local endpoint to wss:// (${wsUrl})`);
+          protocolToTry = "wss";
+          this.currentProtocol = "wss";
+          wsUrl = this.getResolvedUrl("wss");
+        }
+      }
     }
 
     // On HTTPS origin: check if secure relay endpoint is configured
-    if (isHttpsOrigin && protocolToTry === 'wss') {
-      const endpointToCheck = (this.secureEndpoint || ENV_SECURE_RELAY_URL || '').trim();
+    if (isHttpsOrigin && protocolToTry === "wss") {
+      const endpointToCheck = (this.secureEndpoint || ENV_SECURE_RELAY_URL || "").trim();
       if (!endpointToCheck || this.isPrivateIp(endpointToCheck)) {
-        const relayMsg = 'Secure relay unavailable. Please configure VITE_SECURE_RELAY_URL or enter a valid WSS relay endpoint.';
+        const relayMsg = "Secure relay unavailable. Please configure VITE_SECURE_RELAY_URL or enter a valid WSS relay endpoint.";
         console.warn(relayMsg);
-        this.linkState = 'ERROR';
-        this.errorCategory = 'RELAY_UNAVAILABLE';
-        this.lastErrorMessage = 'Secure relay unavailable.';
+        this.linkState = "ERROR";
+        this.errorCategory = "RELAY_UNAVAILABLE";
+        this.lastErrorMessage = "Secure relay unavailable.";
         this.notifyState({
-          phase: 'SERIAL_OPEN_FAILED',
-          message: 'Secure relay unavailable.',
-          error: 'RELAY_UNAVAILABLE'
+          phase: "SERIAL_OPEN_FAILED",
+          message: "Secure relay unavailable.",
+          error: "RELAY_UNAVAILABLE"
         });
         return false;
       }
     }
 
+    // Render Cold-Start Wake-Up: trigger non-blocking fetch to /health prior to opening WebSocket
+    let healthUrl: string | null = null;
+    if (protocolToTry === "wss") {
+      try {
+        const clean = wsUrl.replace(/^wss:\/\//i, "https://").replace(/^ws:\/\//i, "http://");
+        const parsed = new URL(clean);
+        healthUrl = `${parsed.protocol}//${parsed.host}/health`;
+      } catch (e) {
+        if (wsUrl.includes(".onrender.com")) {
+          healthUrl = wsUrl.replace(/^wss:\/\//i, "https://").split("?")[0].replace(/\/ws$/, "/health");
+        }
+      }
+      if (healthUrl) {
+        console.log(`[WS] Render cold-start wake-up: triggering non-blocking fetch to ${healthUrl}`);
+        fetch(healthUrl, { mode: "no-cors" }).catch(() => {});
+        this.notifyState({
+          phase: "WAKING_RELAY",
+          message: `Waking up cloud relay container (${healthUrl})...`
+        });
+      }
+    }
+
     return new Promise<boolean>((resolve) => {
       this.isConnecting = true;
-      this.linkState = 'CONNECTING';
+      this.linkState = "CONNECTING";
       this.connectStartTime = Date.now();
 
+      // Progressive UI phase reporting: AUTHENTICATING_WSS (WSS) or SERIAL_OPENING (WS)
       this.notifyState({
-        phase: 'SERIAL_OPENING',
-        message: protocolToTry === 'wss'
-          ? `Connecting to Secure WSS Relay at ${wsUrl}...`
+        phase: protocolToTry === "wss" ? "AUTHENTICATING_WSS" : "SERIAL_OPENING",
+        message: protocolToTry === "wss"
+          ? `Authenticating Secure WSS connection to ${wsUrl}...`
           : `Connecting to ESP32 MAVLink bridge at ${wsUrl}...`
       });
 
-      // Progressive connection timeout: 30s for cloud WSS (allows Render free-tier cold start) vs 6s for local LAN
-      const timeoutDurationMs = protocolToTry === 'wss' ? 30000 : 6000;
+      // 30-second progressive connection timeout for cloud WSS relay vs 6s for direct LAN WS
+      const timeoutDurationMs = protocolToTry === "wss" ? 30000 : 6000;
 
       let wakeUpTimer: ReturnType<typeof setTimeout> | null = null;
-      if (protocolToTry === 'wss' && wsUrl.includes('.onrender.com')) {
-        // Asynchronously trigger HTTP GET on /health to kickstart Render container spin-up
-        try {
-          const healthUrl = wsUrl.replace(/^wss:\/\//i, 'https://').split('?')[0].replace(/\/ws$/, '/health');
-          fetch(healthUrl, { mode: 'no-cors' }).catch(() => {});
-        } catch (e) {}
-
+      if (protocolToTry === "wss") {
         wakeUpTimer = setTimeout(() => {
           if (this.isConnecting) {
             this.notifyState({
-              phase: 'SERIAL_OPENING',
-              message: 'Waking up cloud relay container on Render (~25s cold start)...'
+              phase: "WAKING_RELAY",
+              message: "Waking up cloud relay container on Render (~25s cold start)..."
             });
           }
         }, 3500);
@@ -615,39 +687,36 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
           this.isConnecting = false;
           this.cleanupSocket(false);
 
-          let diagError: Esp32ErrorCategory = 'CONNECTION_TIMEOUT';
-          let timeoutDetails = '';
+          let diagError: Esp32ErrorCategory = "CONNECTION_TIMEOUT";
+          let timeoutDetails = "";
 
-          if (protocolToTry === 'wss') {
-            diagError = 'RELAY_UNAVAILABLE';
-            timeoutDetails = ' Cloud relay did not respond within 30 seconds.';
+          if (protocolToTry === "wss") {
+            diagError = "RELAY_UNAVAILABLE";
+            timeoutDetails = " Cloud relay did not respond within 30 seconds.";
           } else {
-            diagError = isLocalTarget ? 'ESP32_UNAVAILABLE' : 'CONNECTION_TIMEOUT';
+            diagError = isLocalTarget ? "ESP32_UNAVAILABLE" : "CONNECTION_TIMEOUT";
             timeoutDetails = ` Could not reach ${wsUrl} within 6 seconds. Verify ESP32 is powered and device is on the same local Wi-Fi.`;
           }
 
-          this.linkState = 'ERROR';
+          this.linkState = "ERROR";
           this.errorCategory = diagError;
-          this.lastErrorMessage = protocolToTry === 'wss' ? `Secure relay unavailable.${timeoutDetails}` : `Connection timeout to ${wsUrl}.${timeoutDetails}`;
-
+          this.lastErrorMessage = protocolToTry === "wss" ? `Secure relay unavailable.${timeoutDetails}` : `Connection timeout to ${wsUrl}.${timeoutDetails}`;
           console.error(`[WS ERROR] ${this.lastErrorMessage}`);
 
-          // In AUTO mode on HTTP ONLY, fallback to WS if WSS timed out
-          if (!isHttpsOrigin && this.protocolMode === 'AUTO' && protocolToTry === 'wss') {
-            console.warn('[WS] AUTO fallback: WSS timed out on HTTP. Trying WS...');
+          if (!isHttpsOrigin && this.protocolMode === "AUTO" && protocolToTry === "wss") {
+            console.warn("[WS] AUTO fallback: WSS timed out on HTTP. Trying WS...");
             this.handleWssFallback(wsUrl).then((fbResult) => resolve(fbResult));
             return;
           }
 
           this.notifyState({
-            phase: 'SERIAL_OPEN_FAILED',
+            phase: "SERIAL_OPEN_FAILED",
             message: this.lastErrorMessage,
             error: diagError
           });
           resolve(false);
         }
       }, timeoutDurationMs);
-
       try {
         const socket = new WebSocket(wsUrl);
         socket.binaryType = 'arraybuffer';
@@ -659,34 +728,40 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
           this.isConnecting = false;
           this.reconnectAttempts = 0;
           this.currentProtocol = protocolToTry;
-          this.linkState = 'CONNECTED';
-          this.errorCategory = 'NONE';
-          this.lastErrorMessage = '';
+          this.linkState = "CONNECTED";
+          this.cloudState = "CONNECTED";
+          this.errorCategory = "NONE";
+          this.lastErrorMessage = "";
           this.latencyMs = Math.max(1, Date.now() - this.connectStartTime);
 
-          if (typeof window !== 'undefined') {
+          if (typeof window !== "undefined") {
             try {
-              localStorage.setItem('esp32_autoconnect', 'true');
-            } catch (e) {
-              // ignore
-            }
+              localStorage.setItem("esp32_autoconnect", "true");
+            } catch (e) {}
           }
 
-          const successMsg = protocolToTry === 'wss'
-            ? `Connected to Secure WSS Relay (${wsUrl}) ✓ Latency: ${this.latencyMs}ms. Waiting for Local Connector & MAVLink Heartbeat…`
+          // Distinct UI phases: WAITING_FOR_ESP32 vs WAITING_FOR_HEARTBEAT
+          const nextPhase = protocolToTry === "wss"
+            ? (this.esp32Online ? "WAITING_FOR_HEARTBEAT" : "WAITING_FOR_ESP32")
+            : "WAITING_FOR_HEARTBEAT";
+
+          const successMsg = protocolToTry === "wss"
+            ? (this.esp32Online
+                ? `Connected to Secure WSS Relay (${wsUrl}) ✓ ESP32 bridge ONLINE. Waiting for MAVLink Heartbeat…`
+                : `Connected to Secure WSS Relay (${wsUrl}) ✓ Waiting for ESP32 bridge to come ONLINE…`)
             : `Connected to ESP32 MAVLink bridge (${wsUrl}) ✓ Latency: ${this.latencyMs}ms. Waiting for Pixhawk Heartbeat…`;
           console.log(`[WS] ${successMsg}`);
 
           this.notifyState({
-            phase: 'SERIAL_OPEN',
+            phase: nextPhase,
             message: successMsg,
             device: {
-              deviceName: protocolToTry === 'wss'
+              deviceName: protocolToTry === "wss"
                 ? `Secure WSS Relay (${this.secureEndpoint || ENV_SECURE_RELAY_URL})`
                 : `ESP32-S3 Wireless Bridge (${this.localHost}:${this.localPort})`,
               productName: `ESP32-S3 MAVLink WebSocket [${protocolToTry.toUpperCase()}] (${this.currentBaudRate} baud)`,
-              manufacturerName: 'Espressif / SAEISS',
-              driverType: 'ESP32_WEBSOCKET',
+              manufacturerName: "Espressif / SAEISS",
+              driverType: "ESP32_WEBSOCKET",
               hasPermission: true,
               baudRate: this.currentBaudRate
             }
@@ -712,46 +787,147 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
               }
             };
             reader.readAsArrayBuffer(event.data);
-          } else if (typeof event.data === 'string') {
-            // Check for JSON status message from Secure Cloud Relay
+          } else if (typeof event.data === "string") {
+            // Multi-hop state tracking: RELAY_STATUS, ESP32_STATUS, QR_ALERT JSON frames
             try {
               const meta = JSON.parse(event.data);
-              if (meta && (meta.type === 'RELAY_STATUS' || meta.type === 'connection_ack')) {
-                const isEspOnline = meta.esp32Online === true;
-                const isConnOnline = meta.connectorOnline !== false && (meta.connectorOnline === true || isEspOnline);
-                this.connectorOnline = isConnOnline;
-                this.esp32Online = isEspOnline;
-                this.wifiConnected = true;
+              if (meta && typeof meta === "object") {
+                if (meta.type === "RELAY_STATUS" || meta.type === "connection_ack") {
+                  const isEspOnline = meta.esp32Online === true || meta.status === "CONNECTED" || meta.status === "ONLINE";
+                  const isConnOnline = meta.connectorOnline !== false && (meta.connectorOnline === true || isEspOnline);
+                  this.connectorOnline = isConnOnline;
+                  this.esp32Online = isEspOnline;
+                  this.cloudState = "CONNECTED";
+                  this.wifiConnected = true;
 
-                if (isEspOnline) {
-                  this.errorCategory = 'NONE';
-                  this.lastErrorMessage = '';
-                  this.linkState = 'CONNECTED';
-                  this.notifyState({
-                    phase: 'SERIAL_OPEN',
-                    message: `ESP32-S3 Wi-Fi bridge (${this.wifiSsid}) ONLINE ✓ Cloud WSS streaming active.`
-                  });
-                } else if (!isConnOnline) {
-                  this.errorCategory = 'CONNECTOR_OFFLINE';
-                  this.lastErrorMessage = 'ESP32 bridge offline on cloud relay.';
-                  this.notifyState({
-                    phase: 'WAITING_FOR_MAVLINK',
-                    message: 'ESP32 bridge offline on cloud relay.',
-                    error: 'CONNECTOR_OFFLINE'
-                  });
-                } else {
-                  this.errorCategory = 'ESP32_UNAVAILABLE';
-                  this.lastErrorMessage = meta.error || 'ESP32 unavailable.';
-                  this.notifyState({
-                    phase: 'WAITING_FOR_MAVLINK',
-                    message: 'ESP32 unavailable.',
-                    error: 'ESP32_UNAVAILABLE'
-                  });
+                  if (meta.baud || meta.esp32Baud || meta.baudRate) {
+                    this.esp32Baud = Number(meta.baud || meta.esp32Baud || meta.baudRate);
+                    this.currentBaudRate = this.esp32Baud;
+                  }
+                  if (meta.rssi !== undefined || meta.esp32Rssi !== undefined) {
+                    this.esp32Rssi = Number(meta.rssi !== undefined ? meta.rssi : meta.esp32Rssi);
+                  }
+
+                  if (isEspOnline) {
+                    this.errorCategory = "NONE";
+                    this.lastErrorMessage = "";
+                    this.linkState = "CONNECTED";
+                    this.notifyState({
+                      phase: "WAITING_FOR_HEARTBEAT",
+                      message: `ESP32 bridge ONLINE (${this.wifiSsid}) ✓ RSSI: ${this.esp32Rssi}dBm @ ${this.esp32Baud} baud. Waiting for MAVLink Heartbeat...`
+                    });
+                  } else if (!isConnOnline) {
+                    this.errorCategory = "CONNECTOR_OFFLINE";
+                    this.lastErrorMessage = "ESP32 bridge offline on cloud relay.";
+                    this.notifyState({
+                      phase: "WAITING_FOR_ESP32",
+                      message: "Cloud relay connected. Waiting for ESP32 bridge to come ONLINE...",
+                      error: "CONNECTOR_OFFLINE"
+                    });
+                  } else {
+                    this.errorCategory = "ESP32_UNAVAILABLE";
+                    this.lastErrorMessage = meta.error || "ESP32 unavailable on cloud relay.";
+                    this.notifyState({
+                      phase: "WAITING_FOR_ESP32",
+                      message: meta.error || "ESP32 bridge offline. Waiting for device...",
+                      error: "ESP32_UNAVAILABLE"
+                    });
+                  }
+                  return;
                 }
-                return;
+
+                if (meta.type === "ESP32_STATUS") {
+                  const isEspOnline = meta.status === "CONNECTED" || meta.status === "ONLINE" || meta.esp32 === "ONLINE";
+                  this.esp32Online = isEspOnline;
+                  this.cloudState = "CONNECTED";
+
+                  if (meta.baud || meta.esp32Baud || meta.baudRate) {
+                    this.esp32Baud = Number(meta.baud || meta.esp32Baud || meta.baudRate);
+                    this.currentBaudRate = this.esp32Baud;
+                  }
+                  if (meta.rssi !== undefined || meta.esp32Rssi !== undefined) {
+                    this.esp32Rssi = Number(meta.rssi !== undefined ? meta.rssi : meta.esp32Rssi);
+                  }
+
+                  if (isEspOnline) {
+                    this.errorCategory = "NONE";
+                    this.lastErrorMessage = "";
+                    this.notifyState({
+                      phase: "WAITING_FOR_HEARTBEAT",
+                      message: `ESP32 status: ONLINE (${this.wifiSsid}) ✓ RSSI: ${this.esp32Rssi}dBm @ ${this.esp32Baud} baud. Waiting for MAVLink Heartbeat...`
+                    });
+                  } else {
+                    this.notifyState({
+                      phase: "WAITING_FOR_ESP32",
+                      message: meta.error || "ESP32 bridge offline or searching for Wi-Fi AP..."
+                    });
+                  }
+                  return;
+                }
+
+                if (meta.type === "ESP32_DIAG") {
+                  const diag: Esp32DiagData = {
+                    type: "ESP32_DIAG",
+                    rssi: meta.rssi !== undefined ? Number(meta.rssi) : this.esp32Rssi,
+                    freeHeap: meta.freeHeap !== undefined ? Number(meta.freeHeap) : undefined,
+                    uartRxBytes: meta.uartRxBytes !== undefined ? Number(meta.uartRxBytes) : 0,
+                    uartTxBytes: meta.uartTxBytes !== undefined ? Number(meta.uartTxBytes) : undefined,
+                    baud: meta.baud !== undefined ? Number(meta.baud) : this.esp32Baud,
+                    ...meta
+                  };
+                  this.esp32DiagData = diag;
+                  this.esp32Online = true;
+                  this.cloudState = "CONNECTED";
+                  this.wifiConnected = true;
+
+                  if (diag.rssi !== undefined) {
+                    this.esp32Rssi = diag.rssi;
+                  }
+                  if (diag.baud !== undefined && diag.baud > 0) {
+                    this.esp32Baud = diag.baud;
+                    this.currentBaudRate = diag.baud;
+                  }
+
+                  if (diag.uartRxBytes === 0) {
+                    const warningMsg = "ESP32 Online, but 0 bytes on GPIO 18 RX — Check Pixhawk TELEM2 Pin 2/3 wiring";
+                    this.lastErrorMessage = warningMsg;
+                    this.errorCategory = "NONE";
+                    this.notifyState({
+                      phase: "WAITING_FOR_HEARTBEAT",
+                      message: warningMsg
+                    });
+                  } else {
+                    this.lastErrorMessage = "";
+                    this.errorCategory = "NONE";
+                    this.notifyState({
+                      phase: "WAITING_FOR_HEARTBEAT",
+                      message: `ESP32 Online (${diag.uartRxBytes} bytes RX, RSSI: ${this.esp32Rssi}dBm)`
+                    });
+                  }
+
+                  this.esp32DiagListeners.forEach((fn) => {
+                    try {
+                      fn(diag);
+                    } catch (e) {
+                      console.error('[WS] Error notifying esp32Diag listener:', e);
+                    }
+                  });
+                  return;
+                }
+
+                if (meta.type === "QR_ALERT") {
+                  const qrPayload = meta.payload || meta.code || meta.data || meta.qr;
+                  console.log(`[WS] QR_ALERT frame intercepted: "${qrPayload}"`);
+                  this.qrAlertListeners.forEach((fn) => fn(String(qrPayload)));
+                  this.notifyState({
+                    phase: "WAITING_FOR_HEARTBEAT",
+                    message: `QR Alert intercepted from drone bridge: [${qrPayload}]`
+                  });
+                  return;
+                }
               }
             } catch (err) {
-              // Not a JSON message
+              // Non-JSON frame: forward as text byte stream
             }
 
             const encoder = new TextEncoder();
@@ -811,6 +987,7 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
           // If manually disconnected by user, do not reconnect
           if (this.manualDisconnect) {
             this.linkState = 'DISCONNECTED';
+    this.esp32DiagData = null;
             this.errorCategory = 'NONE';
             this.lastErrorMessage = 'Disconnected by user';
             this.notifyState({
@@ -1018,6 +1195,13 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
       secureEndpoint: this.secureEndpoint,
       connectorOnline: this.connectorOnline,
       esp32Online: this.esp32Online,
+      cloud: this.getCloudState(),
+      esp32: this.esp32Online ? "ONLINE" : "OFFLINE",
+      esp32Baud: this.esp32Baud,
+      esp32Rssi: this.esp32Rssi,
+      esp32Diag: this.esp32DiagData,
+      uartRxBytes: this.esp32DiagData?.uartRxBytes ?? 0,
+      freeHeap: this.esp32DiagData?.freeHeap,
       relayTokenConfigured: Boolean(this.relayToken),
       protocol: this.currentProtocol,
       baudRate: this.currentBaudRate,

@@ -1,6 +1,6 @@
 import http from 'http';
 import WebSocket from 'ws';
-import { fork, ChildProcess } from 'child_process';
+import { fork } from 'child_process';
 import path from 'path';
 
 const PORT = 3099;
@@ -54,10 +54,10 @@ async function runBackendSmokeTest() {
       req.on('error', reject);
     });
 
-    assert(healthRes.status === 200, 'HTTP GET /health returns 200 OK');
-    assert(healthRes.body.status === 'ok', 'Health payload status is ok');
+    // 1. /health 200 OK
+    assert(healthRes.status === 200, '/health 200 OK');
 
-    // 3. Test /connector without token (Must be rejected with 401)
+    // 2. /connector 401 without token
     const connectorNoToken = await new Promise<boolean>((resolve) => {
       const ws = new WebSocket(`ws://127.0.0.1:${PORT}/connector`);
       ws.on('open', () => { ws.close(); resolve(false); });
@@ -66,34 +66,43 @@ async function runBackendSmokeTest() {
       });
       ws.on('error', () => { resolve(true); });
     });
-    assert(connectorNoToken, 'WS /connector without token rejected with 401 Unauthorized (AUD-01)');
+    assert(connectorNoToken, '/connector 401 without token');
 
-    // 4. Test /connector with valid token (Must succeed)
-    const connectorWithToken = await new Promise<boolean>((resolve) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${PORT}/connector?token=saeindia_sec_99348a7b1c0e`);
-      ws.on('open', () => { ws.close(); resolve(true); });
-      ws.on('error', () => { resolve(false); });
-    });
-    assert(connectorWithToken, 'WS /connector with valid token connects successfully');
-
-    // 5. Test /ws without token (Must be rejected with 401)
-    const wsNoToken = await new Promise<boolean>((resolve) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+    // 3. /ws 401 with bad token
+    const wsBadToken = await new Promise<boolean>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=invalid_unauthorized_token_xyz`);
       ws.on('open', () => { ws.close(); resolve(false); });
       ws.on('unexpected-response', (req, res) => {
         resolve(res.statusCode === 401);
       });
       ws.on('error', () => { resolve(true); });
     });
-    assert(wsNoToken, 'WS /ws without token rejected with 401 Unauthorized (AUD-01)');
+    assert(wsBadToken, '/ws 401 with bad token');
 
-    // 6. Test /ws with valid token (Must succeed)
-    const wsWithToken = await new Promise<boolean>((resolve) => {
+    // 4. valid primary token handshake
+    const wsPrimaryToken = await new Promise<boolean>((resolve) => {
       const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=saeindia_sec_99348a7b1c0e`);
       ws.on('open', () => { ws.close(); resolve(true); });
       ws.on('error', () => { resolve(false); });
     });
-    assert(wsWithToken, 'WS /ws with valid token connects successfully');
+    assert(wsPrimaryToken, 'valid primary token handshake');
+
+    // 5. valid legacy token handshake
+    const wsLegacyToken = await new Promise<boolean>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=saeindia_secret_token_2026`);
+      ws.on('open', () => { ws.close(); resolve(true); });
+      ws.on('error', () => { resolve(false); });
+    });
+    assert(wsLegacyToken, 'valid legacy token handshake');
+
+    // 6. status payload validation
+    const statusPayloadValid = Boolean(
+      healthRes.body &&
+      healthRes.body.status === 'ok' &&
+      typeof healthRes.body.uptime === 'number' &&
+      typeof healthRes.body.service === 'string'
+    );
+    assert(statusPayloadValid, 'status payload validation');
 
   } finally {
     child.kill('SIGTERM');

@@ -6,10 +6,13 @@ import {
   PixhawkStatusMessage,
   ConnectionPhase,
   UsbDeviceDiagnostics,
-  DiagnosticsLogEntry
+  DiagnosticsLogEntry,
+  RescueTarget,
+  Esp32DiagData
 } from '../types/mavlink';
 import { usbHostService } from './usbHostService';
 import { transportManager } from './transports/TransportManager';
+import { audioService } from './audioService';
 
 type TelemetryListener = (telemetry: DroneTelemetry) => void;
 type MAVLinkPacketListener = (packet: MAVLinkPacket) => void;
@@ -105,7 +108,7 @@ const SEVERITY_NAMES: Array<PixhawkStatusMessage['severity']> = [
 ];
 
 export const MAVLINK_CRC_EXTRAS: Record<number, number> = {
-  0: 50,   // HEARTBEAT
+  0: 50,   // HEARTBEAT (msgid 0 -> CRC_EXTRA = 50 / 0x32)
   1: 124,  // SYS_STATUS
   2: 137,  // SYSTEM_TIME
   4: 237,  // PING
@@ -119,6 +122,7 @@ export const MAVLINK_CRC_EXTRAS: Record<number, number> = {
   30: 39,  // ATTITUDE
   32: 185, // LOCAL_POSITION_NED
   33: 104, // GLOBAL_POSITION_INT
+  35: 244, // RC_CHANNELS_RAW
   36: 222, // SERVO_OUTPUT_RAW
   39: 254, // MISSION_ITEM
   40: 230, // MISSION_REQUEST
@@ -132,14 +136,26 @@ export const MAVLINK_CRC_EXTRAS: Record<number, number> = {
   62: 183, // NAV_CONTROLLER_OUTPUT
   65: 118, // RC_CHANNELS
   66: 148, // REQUEST_DATA_STREAM
+  69: 243, // MANUAL_CONTROL
+  70: 124, // RC_CHANNELS_OVERRIDE
   73: 38,  // MISSION_ITEM_INT
-  74: 20,  // VFR_HUD (AUD-05)
+  74: 20,  // VFR_HUD
   75: 158, // COMMAND_INT
   76: 152, // COMMAND_LONG
   77: 143, // COMMAND_ACK
+  83: 22,  // ATTITUDE_TARGET
+  85: 140, // POSITION_TARGET_LOCAL_NED
+  87: 150, // POSITION_TARGET_GLOBAL_INT
+  111: 34, // TIMESYNC
+  116: 76, // SCALED_IMU2
   124: 87, // GPS2_RAW
   125: 203, // POWER_STATUS
+  133: 6,  // TERRAIN_REQUEST
+  134: 229, // TERRAIN_DATA
+  135: 203, // TERRAIN_CHECK
+  136: 1,  // TERRAIN_REPORT
   147: 154, // BATTERY_STATUS
+  148: 178, // AUTOPILOT_VERSION
   163: 187, // AHRS2
   168: 21,  // WIND
   242: 104, // HOME_POSITION
@@ -255,6 +271,17 @@ class MAVLinkService {
   private gcsHeartbeatTimer: any = null;
   private heartbeatWaitStartTime: number = 0;
 
+  // Link Quality Tracker: Track MAVLink sequence numbers (0-255) for packet loss %
+  private lastMavlinkSeq: number = -1;
+  private totalPacketsExpected: number = 0;
+  private totalPacketsLost: number = 0;
+  private totalPacketsReceived: number = 0;
+  private seqHistoryWindow: Array<{ seq: number; lost: number; time: number }> = [];
+
+  // Competition QR Code Rescue Target Listeners
+  private rescueTargetListeners: Set<(code: string, target?: RescueTarget) => void> = new Set();
+  private rescueTarget: RescueTarget | null = null;
+
   // Multi-Instance GPS tracking (Arbitrate between GPS 1 on SERIAL3 and GPS 2 on SERIAL4/5)
   private gps1Data = {
     fixType: 'NO_GPS' as GPSLocation['fixType'],
@@ -343,6 +370,17 @@ class MAVLinkService {
       this.handleUsbHostStateChange(phase, message, diag);
     });
 
+    // Subscribe to multi-hop QR_ALERT frames intercepted by ESP32 transport
+    transportManager.getEsp32Transport().subscribeQrAlert((payload: string) => {
+      this.logDiagnostic("MAVLINK", `[MULTI-HOP QR] Intercepted QR alert payload: "${payload}"`, "info");
+      this.validateAndProcessQrPayload(payload);
+    });
+
+    // Subscribe to ESP32 live telemetry diagnostics (TELEM2 GPIO 18 RX byte monitor)
+    transportManager.getEsp32Transport().subscribeEsp32Diag((diag) => {
+      this.handleEsp32Diag(diag);
+    });
+
     // Start heartbeat watchdog
     this.startHeartbeatWatchdog();
 
@@ -412,10 +450,17 @@ class MAVLinkService {
       this.clearSerialDataCheckTimer();
       this.logDiagnostic('USB', 'Link connection lost. Waiting for reconnection…', 'warn');
       this.addStatusMessage('WARNING', 4, 'Link connection lost');
-    } else if (phase === 'WAITING_FOR_MAVLINK') {
+    } else if (phase === 'WAITING_FOR_MAVLINK' || phase === 'WAITING_FOR_HEARTBEAT') {
       this.stopGcsHeartbeat();
       this.clearHeartbeatWaitTimer();
-      this.connectionState.phase = 'WAITING_FOR_MAVLINK';
+      this.connectionState.phase = phase;
+      this.connectionState.isConnected = false;
+      this.connectionState.isUsbConnected = false;
+      this.connectionState.isReceivingTelemetry = false;
+      this.connectionState.phaseMessage = message;
+    } else if (phase === 'WAKING_RELAY' || phase === 'AUTHENTICATING_WSS' || phase === 'WAITING_FOR_ESP32') {
+      this.stopGcsHeartbeat();
+      this.connectionState.phase = phase;
       this.connectionState.isConnected = false;
       this.connectionState.isUsbConnected = false;
       this.connectionState.isReceivingTelemetry = false;
@@ -481,6 +526,9 @@ class MAVLinkService {
       this.connectionState.esp32ErrorMessage = esp32Transport.getLastErrorMessage();
       this.connectionState.esp32ConnectorOnline = esp32Transport.isConnectorOnline();
       this.connectionState.esp32DeviceOnline = esp32Transport.isEsp32Online();
+      this.connectionState.cloudState = esp32Transport.getCloudState();
+      this.connectionState.esp32Baud = esp32Transport.getEsp32Baud();
+      this.connectionState.esp32Rssi = esp32Transport.getEsp32Rssi();
     }
 
     this.notifyConnection();
@@ -537,43 +585,51 @@ class MAVLinkService {
   private startHeartbeatWatchdog() {
     if (this.heartbeatWatchdogTimer) clearInterval(this.heartbeatWatchdogTimer);
     this.heartbeatWatchdogTimer = setInterval(() => {
-      if (this.connectionState.isConnected) {
-        const ageMs = Date.now() - this.connectionState.lastHeartbeat;
+      const now = Date.now();
+      if (this.connectionState.lastHeartbeat > 0) {
+        const ageMs = now - this.connectionState.lastHeartbeat;
         this.connectionState.diagnostics.lastHeartbeatAgeMs = ageMs;
 
-        const now = Date.now();
-        this.heartbeatTimestamps = this.heartbeatTimestamps.filter(t => now - t < 5000);
-        this.connectionState.heartbeatHz = +(this.heartbeatTimestamps.length / 5.0).toFixed(1);
+        // Sliding 3.5-second heartbeat window
+        this.heartbeatTimestamps = this.heartbeatTimestamps.filter(t => now - t <= 3500);
+        if (this.heartbeatTimestamps.length >= 2) {
+          const spanSec = (this.heartbeatTimestamps[this.heartbeatTimestamps.length - 1] - this.heartbeatTimestamps[0]) / 1000;
+          this.connectionState.heartbeatHz = spanSec > 0 ? +( (this.heartbeatTimestamps.length - 1) / spanSec ).toFixed(1) : 0;
+        } else if (ageMs > 1500) {
+          this.connectionState.heartbeatHz = 0;
+        }
         this.connectionState.diagnostics.heartbeatHz = this.connectionState.heartbeatHz;
 
-        // Stable 12-second loss threshold with hysteresis to eliminate rapid on/off flapping
-        if (ageMs > 12000) {
-          if (this.connectionState.isReceivingTelemetry) {
+        // Strictly revert to WAITING_FOR_HEARTBEAT if no heartbeat arrives within 3.5 seconds
+        if (ageMs > 3500) {
+          if (this.connectionState.isConnected || this.connectionState.isReceivingTelemetry) {
+            this.connectionState.isConnected = false;
             this.connectionState.isReceivingTelemetry = false;
-            this.connectionState.phase = 'WAITING_FOR_MAVLINK';
-            this.connectionState.phaseMessage = 'MAVLink Telemetry Paused (No Heartbeat > 12s)';
-            this.logDiagnostic('MAVLINK', '[MAVLINK] Heartbeat stream paused (> 12s since last packet)', 'warn');
-            this.addStatusMessage('WARNING', 4, 'MAVLink Telemetry Stream Paused (No Heartbeat > 12s)');
+            this.connectionState.phase = "WAITING_FOR_HEARTBEAT";
+            this.connectionState.phaseMessage = `Waiting for MAVLink Heartbeat (no heartbeat received for ${(ageMs / 1000).toFixed(1)}s)...`;
+            this.connectionState.heartbeatHz = 0;
+            this.telemetry.pixhawkConnected = false;
+            this.logDiagnostic("MAVLINK", "[MAVLINK] Heartbeat lost (> 3.5s). Reverting to WAITING_FOR_HEARTBEAT.", "warn");
+            this.addStatusMessage("WARNING", 4, "MAVLink Heartbeat lost (> 3.5s). Reverting to WAITING_FOR_HEARTBEAT.");
             this.notifyConnection();
+            this.notifyTelemetry();
           }
-        } else {
+        } else if (this.connectionState.isConnected) {
           if (!this.connectionState.isReceivingTelemetry) {
             this.connectionState.isReceivingTelemetry = true;
-            this.connectionState.phase = 'PIXHAWK_CONNECTED';
-            this.connectionState.phaseMessage = 'Pixhawk Connected ✓';
+            this.connectionState.phase = "PIXHAWK_CONNECTED";
+            this.connectionState.phaseMessage = `Pixhawk connected ✓ (${this.connectionState.heartbeatHz} Hz)`;
             this.notifyConnection();
           }
-
-          // Telemetry & GPS stream keeper: If connected and no GPS message received in > 3.5s, refresh stream requests
-          const lastGpsAge = Date.now() - Math.max(this.gps1Data?.lastUpdated || 0, this.gps2Data?.lastUpdated || 0);
+          // Telemetry stream keeper: refresh stream requests if GPS is absent > 3.5s
+          const lastGpsAge = now - Math.max(this.gps1Data?.lastUpdated || 0, this.gps2Data?.lastUpdated || 0);
           if (lastGpsAge > 3500) {
             this.requestMavlinkDataStreams();
           }
         }
       }
-    }, 500);
+    }, 250);
   }
-
   public subscribeTelemetry(fn: TelemetryListener) {
     this.listeners.add(fn);
     fn(this.getTelemetry());
@@ -939,6 +995,12 @@ class MAVLinkService {
     // Clear MAVLink parser ring buffer
     this.rxBufferLen = 0;
     this.heartbeatTimestamps = [];
+    this.lastMavlinkSeq = -1;
+    this.totalPacketsExpected = 0;
+    this.totalPacketsLost = 0;
+    this.totalPacketsReceived = 0;
+    this.seqHistoryWindow = [];
+    this.connectionState.packetLossPercent = 0;
 
     // Disconnect active transport
     await usbHostService.disconnect();
@@ -1087,9 +1149,42 @@ class MAVLinkService {
     }
   }
 
+  /** Link Quality Tracker: Track MAVLink sequence numbers (0-255) to calculate real-time packet loss percentage */
+  private trackMavlinkSequence(seq: number) {
+    this.totalPacketsReceived++;
+    if (this.lastMavlinkSeq === -1) {
+      this.lastMavlinkSeq = seq;
+      this.totalPacketsExpected = 1;
+      this.connectionState.packetLossPercent = 0;
+      return;
+    }
+    const diff = (seq - this.lastMavlinkSeq) & 0xFF;
+    if (diff === 0) {
+      // Duplicate packet
+      return;
+    }
+    const lost = diff > 1 ? diff - 1 : 0;
+    this.totalPacketsExpected += diff;
+    this.totalPacketsLost += lost;
+    this.lastMavlinkSeq = seq;
+
+    // Real-time sliding window over the last 100 packets
+    this.seqHistoryWindow.push({ seq, lost, time: Date.now() });
+    if (this.seqHistoryWindow.length > 100) {
+      this.seqHistoryWindow.shift();
+    }
+    const windowLost = this.seqHistoryWindow.reduce((acc, cur) => acc + cur.lost, 0);
+    const windowTotal = this.seqHistoryWindow.length + windowLost;
+    const lossPercent = windowTotal > 0 ? (windowLost / windowTotal) * 100 : 0;
+
+    this.connectionState.packetLossPercent = +lossPercent.toFixed(1);
+    this.connectionState.diagnostics.packetLossPercent = this.connectionState.packetLossPercent;
+    this.connectionState.diagnostics.packetsLost = this.totalPacketsLost;
+  }
   private decodeMavlink1Packet(frame: Uint8Array) {
     const payloadLen = frame[1];
     const seq = frame[2];
+    this.trackMavlinkSequence(seq);
     const sysId = frame[3];
     const compId = frame[4];
     const msgId = frame[5];
@@ -1101,6 +1196,7 @@ class MAVLinkService {
   private decodeMavlink2Packet(frame: Uint8Array) {
     const payloadLen = frame[1];
     const seq = frame[4];
+    this.trackMavlinkSequence(seq);
     const sysId = frame[5];
     const compId = frame[6];
     const msgId = frame[7] | (frame[8] << 8) | (frame[9] << 16);
@@ -1147,11 +1243,23 @@ class MAVLinkService {
     const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
 
     switch (msgId) {
-      // HEARTBEAT (msgId = 0) -> Proof of MAVLink Connection!
+      // HEARTBEAT (msgId = 0) -> Strict gating of isConnected = true on >= 1.0 Hz
       case 0: {
         this.clearHeartbeatWaitTimer();
         this.connectionState.lastHeartbeat = now;
         this.heartbeatTimestamps.push(now);
+        this.heartbeatTimestamps = this.heartbeatTimestamps.filter(t => now - t <= 3500);
+
+        // Real-time instantaneous & sliding window frequency calculation
+        let currentHz = 0;
+        if (this.heartbeatTimestamps.length >= 2) {
+          const spanSec = (this.heartbeatTimestamps[this.heartbeatTimestamps.length - 1] - this.heartbeatTimestamps[0]) / 1000;
+          currentHz = spanSec > 0 ? (this.heartbeatTimestamps.length - 1) / spanSec : 1.0;
+        } else if (this.heartbeatTimestamps.length === 1 && this.connectionState.isConnected) {
+          currentHz = 1.0;
+        }
+        this.connectionState.heartbeatHz = +currentHz.toFixed(1);
+        this.connectionState.diagnostics.heartbeatHz = this.connectionState.heartbeatHz;
         this.connectionState.diagnostics.heartbeatsCount++;
         this.connectionState.systemId = sysId;
         this.connectionState.componentId = compId;
@@ -1159,12 +1267,33 @@ class MAVLinkService {
         this.connectionState.diagnostics.componentId = compId;
         this.connectionState.mavlinkVersion = mavVersion;
 
-        const wasNotConnected = !this.connectionState.isConnected;
-        this.connectionState.isConnected = true;
-        this.connectionState.isReceivingTelemetry = true;
-        this.connectionState.phase = 'PIXHAWK_CONNECTED';
-        this.connectionState.phaseMessage = `Pixhawk connected ✓ (${mavVersion})`;
-        this.telemetry.pixhawkConnected = true;
+        // Strictly gate isConnected = true on valid HEARTBEAT reception at >= 1.0 Hz
+        const isRateValid = currentHz >= 1.0 || (
+          this.heartbeatTimestamps.length >= 2 &&
+          (this.heartbeatTimestamps[this.heartbeatTimestamps.length - 1] - this.heartbeatTimestamps[this.heartbeatTimestamps.length - 2]) <= 1100
+        );
+
+        if (isRateValid) {
+          const wasNotConnected = !this.connectionState.isConnected;
+          this.connectionState.isConnected = true;
+          this.connectionState.isReceivingTelemetry = true;
+          this.connectionState.phase = "PIXHAWK_CONNECTED";
+          this.connectionState.phaseMessage = `Pixhawk connected ✓ (${mavVersion} @ ${this.connectionState.heartbeatHz} Hz)`;
+          this.telemetry.pixhawkConnected = true;
+
+          if (wasNotConnected) {
+            this.startGcsHeartbeat();
+            // Auto Stream Rate Request on first valid HEARTBEAT:
+            this.requestMavlinkDataStreams();
+            this.logDiagnostic("MAVLINK", `[MAVLINK] HEARTBEAT validated at ${this.connectionState.heartbeatHz} Hz (>= 1.0 Hz) ✓ SysID: ${sysId}, CompID: ${compId}`, "success");
+            this.addStatusMessage("INFO", 6, `Pixhawk Connected: Heartbeat verified at ${this.connectionState.heartbeatHz} Hz`);
+          }
+        } else {
+          if (!this.connectionState.isConnected) {
+            this.connectionState.phase = "WAITING_FOR_HEARTBEAT";
+            this.connectionState.phaseMessage = `Heartbeat detected (${this.connectionState.heartbeatHz} Hz). Awaiting >= 1.0 Hz stream...`;
+          }
+        }
 
         if (payload.length >= 9) {
           const customMode = view.getUint32(0, true);
@@ -1179,11 +1308,10 @@ class MAVLinkService {
           this.connectionState.diagnostics.vehicleType = VEHICLE_TYPE_NAMES[type] || `TYPE_${type}`;
 
           this.telemetry.isArmed = isArmed;
-          this.telemetry.flightMode = flightModeName || 'STABILIZE';
-          this.connectionState.vehicleState = isArmed ? 'ARMED' : 'DISARMED';
-          this.telemetry.vehicleState = isArmed ? 'ARMED' : 'DISARMED';
+          this.telemetry.flightMode = flightModeName || "STABILIZE";
+          this.connectionState.vehicleState = isArmed ? "ARMED" : "DISARMED";
+          this.telemetry.vehicleState = isArmed ? "ARMED" : "DISARMED";
 
-          // Clear pending flight mode if confirmed by Pixhawk HEARTBEAT
           if (this.connectionState.pendingFlightMode && this.connectionState.pendingFlightMode === flightModeName) {
             this.connectionState.pendingFlightMode = undefined;
             this.connectionState.lastModeChangeError = undefined;
@@ -1195,23 +1323,11 @@ class MAVLinkService {
             }
           }
 
-          // Clear preArmFailReason when vehicle is armed
           if (isArmed && this.connectionState.preArmFailReason) {
             this.connectionState.preArmFailReason = undefined;
             this.connectionState.preArmChecksPassed = true;
           }
-
-          console.log(`[HEARTBEAT] sysid: ${sysId} armed: ${isArmed}`);
-        }
-
-        if (wasNotConnected) {
-          this.startGcsHeartbeat();
-          this.requestMavlinkDataStreams();
-          this.logDiagnostic('MAVLINK', `[MAVLINK] HEARTBEAT received ✓! SysID: ${sysId}, CompID: ${compId}, Autopilot: ${this.connectionState.autopilotType}, Type: ${this.connectionState.diagnostics.vehicleType}`, 'success');
-          this.addStatusMessage('INFO', 6, `Pixhawk Connected: Heartbeat Received from SysID ${sysId} (${this.connectionState.autopilotType})`);
-        }
-
-        this.emitPacket('HEARTBEAT', { sysId, compId, seq });
+        }        this.emitPacket('HEARTBEAT', { sysId, compId, seq });
         this.notifyTelemetry();
         this.notifyConnection();
         break;
@@ -1767,6 +1883,13 @@ class MAVLinkService {
             text += String.fromCharCode(textBytes[j]);
           }
           if (text.length > 0) {
+            // Scan for intercepted QR competition rescue payloads (e.g. "QR_CODE:42", "QR: 42" or "RESCUE_CODE: 42")
+            const qrMatch = text.match(/QR_CODE:(\d{2})/i) ||
+                            text.match(/(?:QR(?:_CODE)?|TARGET|RESCUE)[_:\s=]+(\d{2})\b/i) ||
+                            text.match(/\bQR\s*(\d{2})\b/i);
+            if (qrMatch && qrMatch[1]) {
+              this.lockRescueTarget(qrMatch[1]);
+            }
             const lower = text.toLowerCase();
             const explanation = this.explainPreArmFailure(text);
             const displayMsg = explanation !== text ? `${text} (${explanation})` : text;
@@ -2005,6 +2128,8 @@ class MAVLinkService {
       await this.sendMavlinkCommandLong(511, 24 /* GPS_RAW_INT: Primary GPS 1 */, 200000 /* 5 Hz */);
       await this.sendMavlinkCommandLong(511, 124 /* GPS2_RAW: Secondary GPS 2 */, 200000 /* 5 Hz */);
       await this.sendMavlinkCommandLong(511, 65 /* RC_CHANNELS: TELEM1 receiver sticks */, 250000 /* 4 Hz */);
+      await this.sendMavlinkCommandLong(511, 253 /* STATUSTEXT: Pixhawk notices & alerts */, 500000 /* 2 Hz */);
+      this.logDiagnostic("MAVLINK", "[AUTO STREAM] Requested GPS, Attitude, VFR_HUD, and STATUSTEXT streams from Pixhawk ✓", "info");
     } catch (e) {
       console.warn('Failed to send MAV_CMD_SET_MESSAGE_INTERVAL', e);
     }
@@ -3271,6 +3396,237 @@ class MAVLinkService {
     return crc & 0xFFFF;
   }
 
+  /**
+   * Lock rescue target in GCS state with rescue coordinates (lat, lon, alt)
+   */
+  public lockRescueTarget(code: string, lat?: number, lon?: number, alt?: number): RescueTarget | null {
+    const trimmed = (code || '').trim();
+    const QR_REGEX = /^\d{2}$/;
+    if (!QR_REGEX.test(trimmed)) {
+      const warnMsg = `Invalid rescue code: "${code}". Must match 2-digit format (^\d{2}$).`;
+      this.logDiagnostic("SYSTEM", `[RESCUE TARGET] ${warnMsg}`, "warn");
+      this.addStatusMessage("WARNING", 4, warnMsg);
+      return null;
+    }
+
+    // Capture GPS coordinates from GLOBAL_POSITION_INT / telemetry
+    let targetLat = lat !== undefined && Math.abs(lat) > 0.001 ? lat : this.telemetry.latitude;
+    let targetLon = lon !== undefined && Math.abs(lon) > 0.001 ? lon : this.telemetry.longitude;
+    let targetAlt = alt !== undefined ? alt : this.telemetry.altitude;
+
+    // Fallback to GPS_RAW_INT / raw GPS telemetry if GLOBAL_POSITION_INT is zero
+    if (Math.abs(targetLat) <= 0.001 || Math.abs(targetLon) <= 0.001) {
+      if (Math.abs(this.telemetry.gps.latitude) > 0.001 && Math.abs(this.telemetry.gps.longitude) > 0.001) {
+        targetLat = this.telemetry.gps.latitude;
+        targetLon = this.telemetry.gps.longitude;
+        if (targetAlt <= 0) targetAlt = this.telemetry.gps.altitude;
+      } else if (Math.abs(this.gps2Data.lat) > 0.001 && Math.abs(this.gps2Data.lon) > 0.001) {
+        targetLat = this.gps2Data.lat;
+        targetLon = this.gps2Data.lon;
+        if (targetAlt <= 0) targetAlt = this.gps2Data.alt;
+      } else if (Math.abs(this.gps1Data.lat) > 0.001 && Math.abs(this.gps1Data.lon) > 0.001) {
+        targetLat = this.gps1Data.lat;
+        targetLon = this.gps1Data.lon;
+        if (targetAlt <= 0) targetAlt = this.gps1Data.alt;
+      }
+    }
+
+    const rescueTarget: RescueTarget = {
+      code: trimmed,
+      lat: targetLat,
+      lon: targetLon,
+      alt: targetAlt,
+      lockedAt: Date.now()
+    };
+
+    this.rescueTarget = rescueTarget;
+    this.connectionState.rescueTarget = rescueTarget;
+    this.connectionState.latestValidatedQr = trimmed;
+
+    const hasValidCoords = Math.abs(targetLat) > 0.001 && Math.abs(targetLon) > 0.001;
+    const coordStr = hasValidCoords
+      ? `Lat: ${targetLat.toFixed(7)}, Lon: ${targetLon.toFixed(7)}, Alt: ${targetAlt.toFixed(1)}m`
+      : `(GPS pending / no fix)`;
+
+    this.logDiagnostic(
+      "MAVLINK",
+      `[RESCUE TARGET LOCKED] Code: [${trimmed}] at ${coordStr} ✓`,
+      "success"
+    );
+    this.addStatusMessage("NOTICE", 5, `Rescue Target Locked: [${trimmed}] at ${coordStr}`);
+
+    // Trigger audio & haptic notification
+    audioService.playQrDetected();
+    audioService.triggerHaptic("success");
+
+    // Notify registered rescue target listeners
+    this.rescueTargetListeners.forEach((fn) => {
+      try {
+        fn(trimmed, rescueTarget);
+      } catch (e) {
+        console.error("[MAVLINK] Error in rescueTargetListener:", e);
+      }
+    });
+
+    this.notifyConnection();
+    this.notifyTelemetry();
+    return rescueTarget;
+  }
+
+  public getRescueTarget(): RescueTarget | null {
+    return this.rescueTarget || this.connectionState.rescueTarget || null;
+  }
+
+  /** QR Code Validator: Validate intercepted QR payloads against regex ^\d{2}$ and trigger rescue target locking */
+  public validateAndProcessQrPayload(rawPayload: string): { isValid: boolean; code?: string; error?: string } {
+    const trimmed = (rawPayload || "").trim();
+    let code = "";
+    if (/^\d{2}$/.test(trimmed)) {
+      code = trimmed;
+    } else {
+      const match = trimmed.match(/QR_CODE:(\d{2})/i) ||
+                    trimmed.match(/(?:QR(?:_CODE)?|TARGET|RESCUE)[_:\s=]+(\d{2})\b/i) ||
+                    trimmed.match(/\b(\d{2})\b/);
+      if (match && match[1]) {
+        code = match[1];
+      }
+    }
+
+    if (code && /^\d{2}$/.test(code)) {
+      this.lockRescueTarget(code);
+      return { isValid: true, code };
+    } else {
+      const warnMsg = `Invalid QR code payload intercepted: "${rawPayload}". Does not match 2-digit format (^\d{2}$).`;
+      this.logDiagnostic("SYSTEM", `[QR VALIDATOR] ${warnMsg}`, "warn");
+      this.addStatusMessage("WARNING", 4, warnMsg);
+      return { isValid: false, error: warnMsg };
+    }
+  }
+
+  public subscribeRescueTarget(fn: (code: string, target?: RescueTarget) => void): () => void {
+    this.rescueTargetListeners.add(fn);
+    if (this.connectionState.latestValidatedQr) {
+      fn(this.connectionState.latestValidatedQr, this.rescueTarget || undefined);
+    }
+    return () => this.rescueTargetListeners.delete(fn);
+  }
+
+  /**
+   * One-click autonomous trigger: Command LOITER at locked rescue target
+   */
+  public async triggerAutonomousLoiter(): Promise<boolean> {
+    const isConnected = this.connectionState.isConnected || this.connectionState.isUsbConnected;
+    if (!isConnected && !this.simInterval) {
+      this.logDiagnostic('ERROR', 'Cannot trigger Autonomous Loiter: MAVLink not connected', 'error');
+      return false;
+    }
+
+    const target = this.rescueTarget || this.connectionState.rescueTarget;
+    const hasValidCoords = Boolean(target && target.lat && target.lon && Math.abs(target.lat) > 0.001 && Math.abs(target.lon) > 0.001);
+
+    const coordDesc = (hasValidCoords && target) ? ` at (${target.lat.toFixed(5)}, ${target.lon.toFixed(5)})` : '';
+    this.logDiagnostic(
+      'MAVLINK',
+      `[AUTONOMOUS LOITER] Triggering Loiter hold${target ? ` for rescue target [${target.code}]` : ''}${coordDesc}...`,
+      'info'
+    );
+    this.addStatusMessage(
+      'NOTICE',
+      5,
+      `Autonomous Loiter triggered${target ? ` for target [${target.code}]` : ''}`
+    );
+
+    // If airborne and target has valid coordinates, reposition over the target coordinates
+    if (hasValidCoords && target && this.telemetry.altitude >= 1.0) {
+      const alt = target.alt > 1.0 ? target.alt : Math.max(this.telemetry.altitude, 5.0);
+      try {
+        await this.flyToPosition(target.lat, target.lon, alt, 2.0);
+      } catch (err) {
+        console.warn('[AUTONOMOUS LOITER] flyToPosition reposition failed, falling back to mode LOITER:', err);
+      }
+    }
+
+    const success = await this.setFlightMode('LOITER');
+    if (success) {
+      audioService.playTargetLock();
+      audioService.triggerHaptic('success');
+    }
+    return success;
+  }
+
+  /**
+   * One-click autonomous trigger: Log payload drop command, trigger audio buzzer & haptics, and send servo trigger
+   */
+  public async triggerPayloadDrop(): Promise<boolean> {
+    const target = this.rescueTarget || this.connectionState.rescueTarget;
+    const targetStr = target ? ` Target [${target.code}] @ (${target.lat.toFixed(5)}, ${target.lon.toFixed(5)}, ${target.alt.toFixed(1)}m)` : '';
+
+    this.logDiagnostic(
+      'SYSTEM',
+      `[PAYLOAD DROP] Autonomous payload release command triggered.${targetStr} ✓`,
+      'success'
+    );
+    this.addStatusMessage(
+      'NOTICE',
+      5,
+      `Payload Drop Command Executed!${target ? ` Target: [${target.code}]` : ''}`
+    );
+
+    // Trigger audio buzzer and haptic feedback
+    audioService.playBeep(1200, 300, 'square');
+    setTimeout(() => audioService.playBeep(1600, 350, 'square'), 320);
+    audioService.triggerHaptic('heavy');
+
+    // Send MAVLink command to activate payload release servo / gripper (MAV_CMD_DO_SET_SERVO / Pixhawk AUX1)
+    const isConnected = this.connectionState.isConnected || this.connectionState.isUsbConnected;
+    if (isConnected) {
+      try {
+        // MAV_CMD_DO_SET_SERVO = 183: param1 = servo 9 (AUX1), param2 = 2000 pwm
+        await this.sendMavlinkCommandLong(183 /* MAV_CMD_DO_SET_SERVO */, 9, 2000, 0, 0, 0, 0, 0);
+      } catch (e) {
+        console.warn('[PAYLOAD DROP] MAVLink servo command error:', e);
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Handle incoming ESP32 live diagnostics frame (TELEM2 GPIO 18 RX byte monitor)
+   */
+  private handleEsp32Diag(diag: Esp32DiagData) {
+    this.connectionState.esp32Diag = diag;
+    if (diag.uartRxBytes !== undefined) {
+      this.connectionState.esp32UartRxBytes = diag.uartRxBytes;
+      this.connectionState.diagnostics.serialDataReceived = diag.uartRxBytes > 0;
+    }
+    if (diag.freeHeap !== undefined) {
+      this.connectionState.esp32FreeHeap = diag.freeHeap;
+    }
+    if (diag.rssi !== undefined) {
+      this.connectionState.esp32Rssi = diag.rssi;
+    }
+    if (diag.baud !== undefined) {
+      this.connectionState.esp32Baud = diag.baud;
+    }
+
+    if (diag.uartRxBytes === 0) {
+      const msg = "ESP32 Online, but 0 bytes on GPIO 18 RX — Check Pixhawk TELEM2 Pin 2/3 wiring";
+      this.connectionState.phaseMessage = msg;
+      this.connectionState.errorMessage = msg;
+      this.logDiagnostic("TRANSPORT", msg, "warn");
+    }
+
+    this.notifyConnection();
+  }
+
+  public subscribeEsp32Diag(listener: (diag: Esp32DiagData) => void): () => void {
+    return transportManager.getEsp32Transport().subscribeEsp32Diag(listener);
+  }
+
+  public getEsp32Diag(): Esp32DiagData | null {
+    return transportManager.getEsp32Transport().getEsp32Diag();
+  }
   public switchToSimulationMode() {
     this.disconnect();
     this.connectionState.connectionType = 'SIMULATED';

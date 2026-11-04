@@ -51,6 +51,9 @@ export type ConnectionPhase =
   | 'PERMISSION_GRANTED'
   | 'OPENING_USB'
   | 'USB_CONNECTED'
+  | 'WAKING_RELAY'
+  | 'AUTHENTICATING_WSS'
+  | 'WAITING_FOR_ESP32'
   | 'WAITING_FOR_HEARTBEAT'
   | 'MAVLINK_CONNECTED'
   // Diagnostic Failure States
@@ -89,6 +92,8 @@ export interface UsbDeviceDiagnostics {
   baudRate?: number;
   totalPacketsReceived: number;
   heartbeatsCount: number;
+  packetsLost?: number;
+  packetLossPercent?: number;
   lastHeartbeatAgeMs?: number;
   heartbeatHz?: number;
   systemId?: number;
@@ -181,6 +186,14 @@ export interface PixhawkConnectionState {
   esp32ErrorMessage?: string;
   esp32ConnectorOnline?: boolean;
   esp32DeviceOnline?: boolean;
+  cloudState?: 'CONNECTED' | 'DISCONNECTED';
+  esp32Baud?: number;
+  esp32Rssi?: number;
+  latestValidatedQr?: string;
+  rescueTarget?: RescueTarget;
+  esp32Diag?: Esp32DiagData;
+  esp32UartRxBytes?: number;
+  esp32FreeHeap?: number;
   pendingFlightMode?: string;
   lastModeChangeError?: string;
   gpsInstances?: {
@@ -196,4 +209,22 @@ export interface MotorConfigurationInfo {
   totalMotors: 4;
   mixingControlledByPixhawk: true;
   motorNotes: string;
+}
+
+export interface RescueTarget {
+  code: string;
+  lat: number;
+  lon: number;
+  alt: number;
+  lockedAt: number;
+}
+
+export interface Esp32DiagData {
+  type?: string;
+  rssi?: number;
+  freeHeap?: number;
+  uartRxBytes?: number;
+  uartTxBytes?: number;
+  baud?: number;
+  [key: string]: any;
 }
