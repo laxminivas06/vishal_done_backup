@@ -55,7 +55,7 @@ export const ConnectionStatusDeck: React.FC<ConnectionStatusDeckProps> = ({
 }) => {
   const isWifiOn = typeof navigator !== 'undefined' && navigator.onLine;
   const isEsp32Reachable = pixhawkState.isUsbConnected || pixhawkState.isConnected;
-  const isWsOpen = pixhawkState.isUsbConnected && pixhawkState.connectionType === 'ESP32_WEBSOCKET';
+  const isWsOpen = pixhawkState.connectionType === 'ESP32_WEBSOCKET' && (pixhawkState.cloudState === 'CONNECTED' || pixhawkState.esp32LinkState === 'CONNECTED' || pixhawkState.isUsbConnected || pixhawkState.isConnected);
   const isMavlinkUp = pixhawkState.isConnected;
   const isDroneAndroid = telemetry.pixhawkConnected || pixhawkState.isConnected;
   const isRunnerUp = runnerLink.isConnected;

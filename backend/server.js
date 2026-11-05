@@ -629,16 +629,19 @@ function handleBrowserConnection(ws) {
   });
 }
 
-// Low-latency Heartbeat & Zombie Socket Pruning (Runs every 10 seconds)
+// Resilient Heartbeat & Zombie Socket Pruning (Runs every 25 seconds with 2-strike tolerance)
 const heartbeatInterval = setInterval(() => {
   // 1. Drone / Connector Check
   if (connectorSocket) {
     if (connectorSocket.isAlive === false) {
-      console.warn('[HEARTBEAT] Connector unresponsive, terminating dead socket.');
-      connectorSocket.terminate();
-      connectorSocket = null;
-      esp32Online = false;
-      broadcastRelayStatus();
+      connectorSocket.missedPings = (connectorSocket.missedPings || 0) + 1;
+      if (connectorSocket.missedPings >= 2) {
+        console.warn('[HEARTBEAT] Connector unresponsive after 2 checks, terminating dead socket.');
+        connectorSocket.terminate();
+        connectorSocket = null;
+        esp32Online = false;
+        broadcastRelayStatus();
+      }
     } else {
       connectorSocket.isAlive = false;
       try {
@@ -650,8 +653,11 @@ const heartbeatInterval = setInterval(() => {
   // 2. Active Browsers Check
   for (const client of browserSockets) {
     if (client.isAlive === false) {
-      client.terminate();
-      browserSockets.delete(client);
+      client.missedPings = (client.missedPings || 0) + 1;
+      if (client.missedPings >= 2) {
+        client.terminate();
+        browserSockets.delete(client);
+      }
     } else {
       client.isAlive = false;
       try {
@@ -659,7 +665,7 @@ const heartbeatInterval = setInterval(() => {
       } catch (e) {}
     }
   }
-}, 10000);
+}, 25000);
 
 heartbeatInterval.unref();
 

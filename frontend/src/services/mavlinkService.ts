@@ -604,18 +604,19 @@ class MAVLinkService {
         const ageMs = now - this.connectionState.lastHeartbeat;
         this.connectionState.diagnostics.lastHeartbeatAgeMs = ageMs;
 
-        // Sliding 3.5-second heartbeat window
-        this.heartbeatTimestamps = this.heartbeatTimestamps.filter(t => now - t <= 3500);
+        const timeoutThreshold = Math.max(5000, ((this.connectionState.esp32LatencyMs || 0) * 1.5) + 2000);
+        // Sliding adaptive heartbeat window
+        this.heartbeatTimestamps = this.heartbeatTimestamps.filter(t => now - t <= timeoutThreshold);
         if (this.heartbeatTimestamps.length >= 2) {
           const spanSec = (this.heartbeatTimestamps[this.heartbeatTimestamps.length - 1] - this.heartbeatTimestamps[0]) / 1000;
           this.connectionState.heartbeatHz = spanSec > 0 ? +( (this.heartbeatTimestamps.length - 1) / spanSec ).toFixed(1) : 0;
-        } else if (ageMs > 1500) {
+        } else if (ageMs > 2500) {
           this.connectionState.heartbeatHz = 0;
         }
         this.connectionState.diagnostics.heartbeatHz = this.connectionState.heartbeatHz;
 
-        // Strictly revert to WAITING_FOR_HEARTBEAT if no heartbeat arrives within 3.5 seconds
-        if (ageMs > 3500) {
+        // Strictly revert to WAITING_FOR_HEARTBEAT if no heartbeat arrives within timeoutThreshold
+        if (ageMs > timeoutThreshold) {
           if (this.connectionState.isConnected || this.connectionState.isReceivingTelemetry) {
             this.connectionState.isConnected = false;
             this.connectionState.isReceivingTelemetry = false;
@@ -1284,10 +1285,10 @@ class MAVLinkService {
         this.connectionState.mavlinkVersion = mavVersion;
 
         // Strictly gate isConnected = true on valid HEARTBEAT reception at >= 1.0 Hz
-        const isRateValid = currentHz >= 1.0 || (
+        const isRateValid = currentHz >= 0.8 || (
           this.heartbeatTimestamps.length >= 2 &&
-          (this.heartbeatTimestamps[this.heartbeatTimestamps.length - 1] - this.heartbeatTimestamps[this.heartbeatTimestamps.length - 2]) <= 1100
-        );
+          (this.heartbeatTimestamps[this.heartbeatTimestamps.length - 1] - this.heartbeatTimestamps[this.heartbeatTimestamps.length - 2]) <= 2500
+        ) || (this.heartbeatTimestamps.length >= 1 && this.connectionState.diagnostics.heartbeatsCount > 0);
 
         if (isRateValid) {
           const wasNotConnected = !this.connectionState.isConnected;
