@@ -43,11 +43,20 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
+using namespace websockets;
+
+void onMessageCallback(websockets::WebsocketsMessage message);
+void onEventsCallback(websockets::WebsocketsEvent event, String data);
+
 // =====================================================================================
 // 1. EARLY BROWNOUT DETECTOR (BOD) SUPPRESSION
 // =====================================================================================
 // Runs before setup() and before global C++ static initializers complete,
 // preventing voltage brownout resets when Wi-Fi radio powers up on 5V rails.
+extern "C" void esp_brownout_init(void) {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+}
+
 __attribute__((constructor)) static void early_disable_bod_constructor() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 }
@@ -273,7 +282,7 @@ void sendEsp32DiagReport() {
 // =====================================================================================
 // WEBSOCKET CLIENT EVENT CALLBACKS (CORE 0)
 // =====================================================================================
-void onMessageCallback(WebsocketsMessage message) {
+void onMessageCallback(websockets::WebsocketsMessage message) {
   if (message.isBinary()) {
     const uint8_t* payload = (const uint8_t*)message.c_str();
     size_t length = message.length();
@@ -282,8 +291,8 @@ void onMessageCallback(WebsocketsMessage message) {
     PixhawkSerial.write(payload, length);
     PixhawkSerial.flush();
 
-    totalTxBytesToPixhawk += length;
-    totalCommandsReceived++;
+    totalTxBytesToPixhawk = totalTxBytesToPixhawk + length;
+    totalCommandsReceived = totalCommandsReceived + 1;
 
     Serial.printf("📥 [GCS -> PIXHAWK] Command (%u bytes) -> Forwarded to TELEM2 (Total TX: %lu bytes)\n",
                   (unsigned int)length, totalTxBytesToPixhawk);
@@ -292,7 +301,7 @@ void onMessageCallback(WebsocketsMessage message) {
   }
 }
 
-void onEventsCallback(WebsocketsEvent event, String data) {
+void onEventsCallback(websockets::WebsocketsEvent event, String data) {
   if (event == WebsocketsEvent::ConnectionOpened) {
     Serial.println("\n*********************************************************");
     Serial.println("🟢 [WSS CLOUD RELAY] >>> CONNECTED SUCCESSFULLY! <<<");
@@ -555,7 +564,7 @@ void resetAssembler() {
 
 void checkAssemblerTimeout() {
   if (asmIdx > 0 && (millis() - asmLastByteTime > 25)) {
-    crcErrorCount++;
+    crcErrorCount = crcErrorCount + 1;
     resetAssembler();
   }
 }
@@ -571,7 +580,7 @@ void handleAssembledMavlinkFrame(const uint8_t* frame, size_t frameLen) {
     savedPixhawkBaud = activePixhawkBaud;
   }
 
-  totalMavlinkPacketsSent++;
+  totalMavlinkPacketsSent = totalMavlinkPacketsSent + 1;
 
   // Intercept STATUSTEXT (msgid 253)
   bool isStatustext = false;
@@ -672,7 +681,7 @@ void feedByteToMavlinkAssembler(uint8_t b) {
   if (asmIdx < MAV_MAX_FRAME_LEN) {
     asmBuf[asmIdx++] = b;
   } else {
-    crcErrorCount++;
+    crcErrorCount = crcErrorCount + 1;
     resetAssembler();
     return;
   }
@@ -684,7 +693,7 @@ void feedByteToMavlinkAssembler(uint8_t b) {
       uint8_t payloadLen = asmBuf[1];
       asmTargetLen = (size_t)payloadLen + 8;
       if (asmTargetLen > MAV_MAX_FRAME_LEN) {
-        crcErrorCount++;
+        crcErrorCount = crcErrorCount + 1;
         resetAssembler();
         return;
       }
@@ -696,7 +705,7 @@ void feedByteToMavlinkAssembler(uint8_t b) {
       uint8_t incompatFlags = asmBuf[2];
       asmTargetLen = (size_t)payloadLen + 12 + ((incompatFlags & 0x01) ? 13 : 0);
       if (asmTargetLen > MAV_MAX_FRAME_LEN) {
-        crcErrorCount++;
+        crcErrorCount = crcErrorCount + 1;
         resetAssembler();
         return;
       }
@@ -724,7 +733,7 @@ void core1UartTask(void* pvParameters) {
     while (PixhawkSerial.available() > 0) {
       uint8_t b = (uint8_t)PixhawkSerial.read();
       feedByteToMavlinkAssembler(b);
-      totalRxBytesFromPixhawk++;
+      totalRxBytesFromPixhawk = totalRxBytesFromPixhawk + 1;
     }
 
     // 2. Check frame assembly gap timeout
@@ -857,6 +866,7 @@ void setup() {
   Serial.println("🚀 SAE INDIA — ESP32-S3 DIRECT CLOUD RELAY CLIENT");
   Serial.println("   Dual-Core FreeRTOS MAVLink Bridge & QR Interceptor");
   Serial.println("=========================================================");
+  Serial.println("🛡️ [BOD] Brownout Detector (BOD) suppressed successfully.");
 
   if (STATUS_LED_PIN >= 0) {
     pinMode(STATUS_LED_PIN, OUTPUT);
