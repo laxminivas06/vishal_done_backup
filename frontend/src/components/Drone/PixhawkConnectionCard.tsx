@@ -180,7 +180,7 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
   const latencyMs = connectionState.esp32LatencyMs || (isConnected && connectionState.lastHeartbeat > 0 ? Math.max(1, Date.now() - connectionState.lastHeartbeat) : 0);
 
   // Granular Stage Flags - Stable 10s loss threshold to prevent rapid connecting/disconnecting flapping
-  const isWebSocketOpen = isUsbConnected && connectionState.connectionType === 'ESP32_WEBSOCKET';
+  const isWebSocketOpen = (isUsbConnected || connectionState.esp32LinkState === 'CONNECTED' || connectionState.isConnected) && connectionState.connectionType === 'ESP32_WEBSOCKET';
   const isMavlinkHeartbeatReceived = isConnected && connectionState.lastHeartbeat > 0 && (Date.now() - connectionState.lastHeartbeat < 10000);
   const isHeartbeatTimeout = phase === 'HEARTBEAT_TIMEOUT' || phase === 'NO_MAVLINK_HEARTBEAT' || (isConnected && Date.now() - connectionState.lastHeartbeat > 10000);
   const isWaitingMavlink = (phase === 'WAITING_FOR_MAVLINK' || phase === 'WAITING_FOR_HEARTBEAT' || phase === 'SERIAL_OPEN') && !isConnected;
@@ -956,10 +956,10 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
                           ? 'bg-amber-400 animate-pulse'
                           : 'bg-slate-600'
                       }`}></span>
-                      <span>Local Connector</span>
+                      <span>Drone Bridge</span>
                     </span>
                     <span className="text-[9px] text-slate-400 mt-0.5">
-                      {isWebSocketOpen && connectionState.esp32ConnectorOnline ? 'Online ✓' : 'Local Agent'}
+                      {isWebSocketOpen && (connectionState.esp32ConnectorOnline || connectionState.esp32DeviceOnline) ? 'Online ✓' : isWebSocketOpen ? 'Connecting...' : 'Drone Bridge'}
                     </span>
                   </div>
 
@@ -981,7 +981,7 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
                       <span>ESP32</span>
                     </span>
                     <span className="text-[9px] text-slate-400 mt-0.5">
-                      {isWebSocketOpen && connectionState.esp32DeviceOnline ? 'Bridged ✓' : 'LAN 192.168.x.x'}
+                      {isWebSocketOpen && connectionState.esp32DeviceOnline ? 'Online ✓' : isWebSocketOpen ? 'Bridged ✓' : 'LAN 192.168.x.x'}
                     </span>
                   </div>
                 </div>

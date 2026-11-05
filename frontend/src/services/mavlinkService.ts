@@ -452,14 +452,27 @@ class MAVLinkService {
       this.logDiagnostic('USB', 'Link connection lost. Waiting for reconnection…', 'warn');
       this.addStatusMessage('WARNING', 4, 'Link connection lost');
     } else if (phase === 'WAITING_FOR_MAVLINK' || phase === 'WAITING_FOR_HEARTBEAT') {
-      this.stopGcsHeartbeat();
       this.clearHeartbeatWaitTimer();
       this.connectionState.phase = phase;
       this.connectionState.isConnected = false;
-      this.connectionState.isUsbConnected = false;
+      this.connectionState.isUsbConnected = true;
       this.connectionState.isReceivingTelemetry = false;
       this.connectionState.phaseMessage = message;
-    } else if (phase === 'WAKING_RELAY' || phase === 'AUTHENTICATING_WSS' || phase === 'WAITING_FOR_ESP32') {
+
+      if (this.connectionState.connectionType === 'ESP32_WEBSOCKET') {
+        this.startGcsHeartbeat();
+        this.requestMavlinkDataStreams();
+      }
+    } else if (phase === 'WAITING_FOR_ESP32') {
+      this.connectionState.phase = phase;
+      this.connectionState.isConnected = false;
+      this.connectionState.isUsbConnected = true;
+      this.connectionState.isReceivingTelemetry = false;
+      this.connectionState.phaseMessage = message;
+      if (this.connectionState.connectionType === 'ESP32_WEBSOCKET') {
+        this.startGcsHeartbeat();
+      }
+    } else if (phase === 'WAKING_RELAY' || phase === 'AUTHENTICATING_WSS') {
       this.stopGcsHeartbeat();
       this.connectionState.phase = phase;
       this.connectionState.isConnected = false;
