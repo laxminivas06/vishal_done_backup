@@ -39,6 +39,35 @@ const ENV_SECURE_RELAY_URL = (typeof import.meta !== 'undefined' && import.meta.
 const ENV_RELAY_TOKEN = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_RELAY_TOKEN) || 'saeindia_sec_99348a7b1c0e';
 const ENV_WIFI_SSID = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_WIFI_SSID) || 'drone123';
 
+/**
+ * Normalizes any user or environment relay URL into a canonical, valid WSS URL.
+ * Strips repeated/nested protocols (e.g. "wss://https://...", "https://...", "ws://...")
+ * and ensures canonical route path (defaults to '/ws') and query strings are preserved.
+ */
+export function normalizeSecureRelayUrl(input: string, fallbackPath = '/ws'): string {
+  let cleaned = (input || '').trim();
+  if (!cleaned) return 'wss://vishal-done-backup.onrender.com/ws';
+
+  // Strip any nested or repeated protocol prefixes: wss://, ws://, https://, http://
+  cleaned = cleaned.replace(/^(wss?:\/\/|https?:\/\/)+/i, '');
+
+  // Separate query parameters if any
+  const qIdx = cleaned.indexOf('?');
+  let hostAndPath = qIdx >= 0 ? cleaned.slice(0, qIdx) : cleaned;
+  const queryString = qIdx >= 0 ? cleaned.slice(qIdx) : '';
+
+  // Strip trailing slashes
+  hostAndPath = hostAndPath.replace(/\/+$/, '');
+
+  // If there's no path (e.g. "vishal-done-backup.onrender.com"), append fallbackPath
+  if (!hostAndPath.includes('/')) {
+    const formatted = fallbackPath.startsWith('/') ? fallbackPath : '/' + fallbackPath;
+    hostAndPath = hostAndPath + formatted;
+  }
+
+  return 'wss://' + hostAndPath + queryString;
+}
+
 function parseWsEndpoint(urlStr: string) {
   try {
     const clean = urlStr.trim().replace(/^ws(s)?:\/\//i, 'http$1://');
@@ -156,9 +185,9 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
         if (savedPort) this.localPort = parseInt(savedPort, 10) || 8080;
         if (savedPath !== null && savedPath !== undefined) this.path = savedPath;
         if (savedSecureEndpoint && savedSecureEndpoint.trim().length > 0 && !savedSecureEndpoint.includes('192.168.')) {
-          this.secureEndpoint = savedSecureEndpoint.trim();
+          this.secureEndpoint = normalizeSecureRelayUrl(savedSecureEndpoint);
         } else {
-          this.secureEndpoint = ENV_SECURE_RELAY_URL;
+          this.secureEndpoint = normalizeSecureRelayUrl(ENV_SECURE_RELAY_URL);
         }
         if (savedToken && savedToken.trim().length > 0 && savedToken !== 'saeindia_secret_token_2026' && savedToken !== 'CHANGE_ME') {
           this.relayToken = savedToken.trim();
@@ -391,22 +420,7 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
 
     if (proto === 'wss') {
       let ep = (this.secureEndpoint || ENV_SECURE_RELAY_URL || 'wss://vishal-done-backup.onrender.com/ws').trim();
-      let url = ep.replace(/^ws:\/\//i, 'wss://');
-      if (!url.startsWith('wss://')) {
-        url = `wss://${url}`;
-      }
-
-      // Ensure appropriate path is present
-      try {
-        const u = new URL(url.replace('wss://', 'https://'));
-        if ((!u.pathname || u.pathname === '/') && this.path) {
-          url = `${url.replace(/\/$/, '')}${formattedPath}`;
-        }
-      } catch (e) {
-        if (!url.includes('/')) {
-          url = `${url}${formattedPath}`;
-        }
-      }
+      let url = normalizeSecureRelayUrl(ep, formattedPath || '/ws');
 
       // Append token if configured and not already included
       const tokenToUse = (this.relayToken || ENV_RELAY_TOKEN).trim();
@@ -446,7 +460,7 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
       this.path = options.path.trim();
     }
     if (options.secureEndpoint !== undefined) {
-      this.secureEndpoint = options.secureEndpoint.trim();
+      this.secureEndpoint = normalizeSecureRelayUrl(options.secureEndpoint.trim(), this.path || '/ws');
     }
     if (options.relayToken !== undefined) {
       this.relayToken = options.relayToken.trim();

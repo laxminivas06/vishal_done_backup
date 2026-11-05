@@ -12,6 +12,7 @@ import {
 } from '../types/mavlink';
 import { usbHostService } from './usbHostService';
 import { transportManager } from './transports/TransportManager';
+import { normalizeSecureRelayUrl } from './transports/Esp32WebSocketTransport';
 import { audioService } from './audioService';
 
 type TelemetryListener = (telemetry: DroneTelemetry) => void;
@@ -901,7 +902,7 @@ class MAVLinkService {
       const host = (options?.host && options.host.trim().length > 0 ? options.host.trim() : '192.168.31.194');
       const p = options?.port || 8080;
       const path = options?.path !== undefined ? options.path.trim() : '/ws';
-      const secureEp = (options?.secureEndpoint || defaultRelayUrl || transportManager.getEsp32Transport().getSecureEndpoint()).trim();
+      const secureEp = normalizeSecureRelayUrl((options?.secureEndpoint || defaultRelayUrl || transportManager.getEsp32Transport().getSecureEndpoint()).trim(), path || '/ws');
       const relayToken = options?.relayToken || transportManager.getEsp32Transport().getRelayToken();
       const proto = options?.protocol || (protocolMode === 'WSS' ? 'wss' : 'ws');
       const baud = options?.baudRate || 57600;

@@ -22,6 +22,6 @@ relay-server/.env
 .idea/
 .DS_Store
 graphify-out/
-firmware
-src
+/firmware
+/src
 .agents/teamwork/

@@ -38,6 +38,7 @@ import {
   Trash2
 } from 'lucide-react';
 import { SerialDiagnosticsModal } from './SerialDiagnosticsModal';
+import { normalizeSecureRelayUrl } from '../../services/transports/Esp32WebSocketTransport';
 
 interface PixhawkConnectionCardProps {
   connectionState: PixhawkConnectionState;
@@ -117,9 +118,12 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
   const [esp32SecureEndpoint, setEsp32SecureEndpoint] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('esp32_secure_endpoint');
-      if (saved && saved.trim().length > 0 && !saved.includes('192.168.')) return saved.trim();
+      if (saved && saved.trim().length > 0 && !saved.includes('192.168.')) {
+        return normalizeSecureRelayUrl(saved);
+      }
     }
-    return (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SECURE_RELAY_URL) || 'wss://vishal-done-backup.onrender.com/ws';
+    const envUrl = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SECURE_RELAY_URL) || 'wss://vishal-done-backup.onrender.com/ws';
+    return normalizeSecureRelayUrl(envUrl);
   });
 
   // Secure Relay Token
@@ -148,13 +152,14 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
 
   // Resolved connection mode and target URL
   const esp32Mode: 'LOCAL' | 'SECURE' = isHttpsOrigin || protocolMode === 'WSS' ? 'SECURE' : 'LOCAL';
-  const cleanPath = esp32Path ? (esp32Path.startsWith('/') ? esp32Path : `/${esp32Path}`) : '';
+  const cleanPath = esp32Path ? (esp32Path.startsWith('/') ? esp32Path : `/${esp32Path}`) : '/ws';
   const effectiveProto = esp32Mode === 'SECURE' ? 'wss' : 'ws';
-  const targetHost = (esp32Mode === 'SECURE' && esp32SecureEndpoint) 
-    ? esp32SecureEndpoint.replace(/^wss?:\/\//i, '').replace(/\/+$/, '') 
+  const normalizedSecureEp = normalizeSecureRelayUrl(esp32SecureEndpoint, cleanPath);
+  const targetHost = (esp32Mode === 'SECURE') 
+    ? normalizedSecureEp.replace(/^(wss?:\/\/|https?:\/\/)+/i, '').replace(/\/+$/, '') 
     : `${esp32Host}:${esp32Port}`;
-  const resolvedTargetUrl = (esp32Mode === 'SECURE' && targetHost.includes('/'))
-    ? `${effectiveProto}://${targetHost}`
+  const resolvedTargetUrl = (esp32Mode === 'SECURE')
+    ? normalizedSecureEp
     : `${effectiveProto}://${targetHost}${cleanPath}`;
 
   // Five Clear Connection States
@@ -248,7 +253,9 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
         localStorage.setItem('esp32_host', esp32Host.trim());
         localStorage.setItem('esp32_port', esp32Port.toString());
         localStorage.setItem('esp32_path', esp32Path.trim());
-        localStorage.setItem('esp32_secure_endpoint', esp32SecureEndpoint.trim());
+        const cleanSecureEndpoint = normalizeSecureRelayUrl(esp32SecureEndpoint, esp32Path || '/ws');
+        setEsp32SecureEndpoint(cleanSecureEndpoint);
+        localStorage.setItem('esp32_secure_endpoint', cleanSecureEndpoint);
         localStorage.setItem('esp32_relay_token', esp32RelayToken.trim());
         localStorage.setItem('esp32_proto', effectiveProto);
         localStorage.setItem('esp32_baud', selectedBaud.toString());
@@ -261,7 +268,7 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
         host: esp32Host.trim(),
         port: esp32Port,
         path: esp32Path.trim(),
-        secureEndpoint: esp32SecureEndpoint.trim(),
+        secureEndpoint: normalizeSecureRelayUrl(esp32SecureEndpoint, esp32Path || '/ws'),
         relayToken: esp32RelayToken.trim(),
         protocol: effectiveProto,
         baudRate: selectedBaud,
@@ -760,6 +767,7 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
                   type="text"
                   value={esp32SecureEndpoint}
                   onChange={(e) => setEsp32SecureEndpoint(e.target.value)}
+                  onBlur={(e) => setEsp32SecureEndpoint(normalizeSecureRelayUrl(e.target.value))}
                   placeholder="wss://vishal-done-backup.onrender.com/ws"
                   className="bg-slate-900 px-2 py-1 rounded text-slate-100 font-mono text-xs w-full border border-slate-700 focus:outline-none focus:border-emerald-500"
                   title="Cloud WSS Relay URL (e.g. wss://vishal-done-backup.onrender.com/ws)"
