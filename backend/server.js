@@ -668,7 +668,11 @@ const PING_TARGET_URL = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNA
 if (!process.env.DISABLE_KEEP_ALIVE) {
   const keepAliveInterval = setInterval(() => {
     try {
-      const pingUrl = new URL('/health', PING_TARGET_URL);
+      let target = PING_TARGET_URL.trim();
+      if (!/^https?:\/\//i.test(target)) {
+        target = 'https://' + target.replace(/^(wss?:\/\/)+/i, '');
+      }
+      const pingUrl = new URL('/health', target);
       const requester = pingUrl.protocol === 'https:' ? https : http;
       requester.get(pingUrl.href, { timeout: 8000 }, (res) => {
         res.resume(); // drain response body

@@ -12,7 +12,7 @@ import {
 } from '../types/mavlink';
 import { usbHostService } from './usbHostService';
 import { transportManager } from './transports/TransportManager';
-import { normalizeSecureRelayUrl } from './transports/Esp32WebSocketTransport';
+import { normalizeSecureRelayUrl, parseWsEndpoint } from './transports/Esp32WebSocketTransport';
 import { audioService } from './audioService';
 
 type TelemetryListener = (telemetry: DroneTelemetry) => void;
@@ -884,25 +884,27 @@ class MAVLinkService {
     if (typeof options === 'string') {
       // Legacy string overload: connectEsp32(host, port, protocol, baudRate)
       const pMode: 'AUTO' | 'WS' | 'WSS' = protocol === 'wss' ? 'WSS' : 'WS';
+      const defaultRelayUrl = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SECURE_RELAY_URL) || 'wss://vishal-done-backup.onrender.com/ws';
       resolvedOptions = {
         protocolMode: pMode,
         mode: protocol === 'wss' ? 'SECURE' : 'LOCAL',
         host: options.trim(),
         port,
         path: '/ws',
-        secureEndpoint: `${options}:${port}`,
+        secureEndpoint: protocol === 'wss' ? normalizeSecureRelayUrl(options) : defaultRelayUrl,
         protocol,
         baudRate,
         wifiSsid: transportManager.getEsp32Transport().getWifiSsid()
       };
     } else {
-      const defaultRelayUrl = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SECURE_RELAY_URL) || '';
+      const defaultRelayUrl = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SECURE_RELAY_URL) || 'wss://vishal-done-backup.onrender.com/ws';
+      const defaultWs = parseWsEndpoint((typeof import.meta !== 'undefined' && import.meta.env?.VITE_ESP32_WS_URL) || 'ws://192.168.31.194:8080/ws');
       const protocolMode = options?.protocolMode || (options?.mode === 'SECURE' ? 'WSS' : 'AUTO');
       const mode = options?.mode || (protocolMode === 'WSS' ? 'SECURE' : 'LOCAL');
-      const host = (options?.host && options.host.trim().length > 0 ? options.host.trim() : '192.168.31.194');
-      const p = options?.port || 8080;
-      const path = options?.path !== undefined ? options.path.trim() : '/ws';
-      const secureEp = normalizeSecureRelayUrl((options?.secureEndpoint || defaultRelayUrl || transportManager.getEsp32Transport().getSecureEndpoint()).trim(), path || '/ws');
+      const host = (options?.host && options.host.trim().length > 0 ? options.host.trim() : defaultWs.host);
+      const p = options?.port || defaultWs.port;
+      const path = options?.path !== undefined ? options.path.trim() : defaultWs.path;
+      const secureEp = normalizeSecureRelayUrl((options?.secureEndpoint || defaultRelayUrl || transportManager.getEsp32Transport().getSecureEndpoint()).trim());
       const relayToken = options?.relayToken || transportManager.getEsp32Transport().getRelayToken();
       const proto = options?.protocol || (protocolMode === 'WSS' ? 'wss' : 'ws');
       const baud = options?.baudRate || 57600;

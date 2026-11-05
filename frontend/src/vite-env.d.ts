@@ -6,6 +6,7 @@ interface ImportMetaEnv {
   readonly VITE_ESP32_WS_URL?: string;
   readonly VITE_SECURE_RELAY_URL?: string;
   readonly VITE_RELAY_TOKEN?: string;
+  readonly VITE_WIFI_SSID?: string;
 }
 
 interface ImportMeta {

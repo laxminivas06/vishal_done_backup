@@ -34,7 +34,7 @@ export interface Esp32WebSocketOptions {
 }
 
 // Environment defaults
-const ENV_ESP32_WS_URL = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_ESP32_WS_URL) || 'wss://vishal-done-backup.onrender.com/ws';
+const ENV_ESP32_WS_URL = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_ESP32_WS_URL) || 'ws://192.168.31.194:8080/ws';
 const ENV_SECURE_RELAY_URL = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SECURE_RELAY_URL) || 'wss://vishal-done-backup.onrender.com/ws';
 const ENV_RELAY_TOKEN = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_RELAY_TOKEN) || 'saeindia_sec_99348a7b1c0e';
 const ENV_WIFI_SSID = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_WIFI_SSID) || 'drone123';
@@ -59,28 +59,75 @@ export function normalizeSecureRelayUrl(input: string, fallbackPath = '/ws'): st
   // Strip trailing slashes
   hostAndPath = hostAndPath.replace(/\/+$/, '');
 
-  // If there's no path (e.g. "vishal-done-backup.onrender.com"), append fallbackPath
+  const effectiveFallback = (fallbackPath && fallbackPath.trim()) ? fallbackPath.trim() : '/ws';
+
+  // If there's no path (e.g. "vishal-done-backup.onrender.com"), append effectiveFallback
   if (!hostAndPath.includes('/')) {
-    const formatted = fallbackPath.startsWith('/') ? fallbackPath : '/' + fallbackPath;
+    const formatted = effectiveFallback.startsWith('/') ? effectiveFallback : '/' + effectiveFallback;
     hostAndPath = hostAndPath + formatted;
+  }
+
+  // Guard: Browser GCS client must connect to /ws, not the ESP32 /connector endpoint
+  if (hostAndPath.endsWith('/connector')) {
+    hostAndPath = hostAndPath.replace(/\/connector$/, '/ws');
   }
 
   return 'wss://' + hostAndPath + queryString;
 }
 
-function parseWsEndpoint(urlStr: string) {
+/**
+ * Normalizes any user or environment direct ESP32 WebSocket URL into a canonical ws:// URL.
+ * Strips repeated/nested protocols and ensures canonical route path (defaults to '/ws') and query strings are preserved.
+ */
+export function normalizeEsp32WsUrl(input: string, fallbackPath = '/ws', defaultPort = 8080): string {
+  let cleaned = (input || '').trim();
+  if (!cleaned) return `ws://192.168.31.194:${defaultPort}/ws`;
+
+  // Strip any nested or repeated protocol prefixes: wss://, ws://, https://, http://
+  cleaned = cleaned.replace(/^(wss?:\/\/|https?:\/\/)+/i, '');
+
+  const qIdx = cleaned.indexOf('?');
+  let hostAndPath = qIdx >= 0 ? cleaned.slice(0, qIdx) : cleaned;
+  const queryString = qIdx >= 0 ? cleaned.slice(qIdx) : '';
+
+  hostAndPath = hostAndPath.replace(/\/+$/, '');
+
+  const slashIdx = hostAndPath.indexOf('/');
+  let hostPart = slashIdx >= 0 ? hostAndPath.slice(0, slashIdx) : hostAndPath;
+  let pathPart = slashIdx >= 0 ? hostAndPath.slice(slashIdx) : '';
+
+  const effectiveFallback = (fallbackPath && fallbackPath.trim()) ? fallbackPath.trim() : '/ws';
+  if (!pathPart || pathPart === '/') {
+    pathPart = effectiveFallback.startsWith('/') ? effectiveFallback : '/' + effectiveFallback;
+  }
+
+  // Ensure defaultPort is attached if hostPart has no port specified
+  if (!hostPart.includes(':') && defaultPort) {
+    hostPart = `${hostPart}:${defaultPort}`;
+  }
+
+  return 'ws://' + hostPart + pathPart + queryString;
+}
+
+export function parseWsEndpoint(urlStr: string) {
   try {
-    const clean = urlStr.trim().replace(/^ws(s)?:\/\//i, 'http$1://');
-    const parsed = new URL(clean);
+    let clean = (urlStr || '').trim();
+    if (!clean) return { host: '192.168.31.194', port: 8080, path: '/ws' };
+    const isHttps = /^wss:\/\//i.test(clean) || /^https:\/\//i.test(clean);
+    clean = clean.replace(/^(wss?:\/\/|https?:\/\/)+/i, '');
+    const dummyProtocol = isHttps ? 'https://' : 'http://';
+    const parsed = new URL(dummyProtocol + clean);
     return {
-      host: parsed.hostname || 'vishal-done-backup.onrender.com',
-      port: parsed.port ? parseInt(parsed.port, 10) : (clean.startsWith('https://') ? 443 : 8080),
-      path: parsed.pathname || '/ws'
+      host: parsed.hostname || (isHttps ? 'vishal-done-backup.onrender.com' : '192.168.31.194'),
+      port: parsed.port ? parseInt(parsed.port, 10) : (isHttps ? 443 : 8080),
+      path: (parsed.pathname && parsed.pathname !== '/') ? parsed.pathname : '/ws'
     };
   } catch (e) {
-    return { host: 'vishal-done-backup.onrender.com', port: 443, path: '/ws' };
+    return { host: '192.168.31.194', port: 8080, path: '/ws' };
   }
 }
+
+const defaultLocalEndpoint = parseWsEndpoint(ENV_ESP32_WS_URL);
 
 export class Esp32WebSocketTransport implements MavlinkTransport {
   public readonly id = 'esp32_websocket';
@@ -97,9 +144,9 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
   // Connection Mode: 'LOCAL' (ws://) vs 'SECURE' (wss://)
   private connectionMode: WebSocketConnectionMode = 'SECURE';
 
-  private localHost: string = '192.168.31.194';
-  private localPort: number = 8080;
-  private path: string = '/ws';
+  private localHost: string = defaultLocalEndpoint.host;
+  private localPort: number = defaultLocalEndpoint.port;
+  private path: string = defaultLocalEndpoint.path;
   private secureEndpoint: string = ENV_SECURE_RELAY_URL;
   private relayToken: string = ENV_RELAY_TOKEN;
   private currentProtocol: 'ws' | 'wss' = 'wss';
@@ -181,9 +228,19 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
 
         if (savedHost && savedHost.trim().length > 0) {
           this.localHost = savedHost.trim();
+        } else {
+          this.localHost = defaultLocalEndpoint.host;
         }
-        if (savedPort) this.localPort = parseInt(savedPort, 10) || 8080;
-        if (savedPath !== null && savedPath !== undefined) this.path = savedPath;
+        if (savedPort) {
+          this.localPort = parseInt(savedPort, 10) || defaultLocalEndpoint.port;
+        } else {
+          this.localPort = defaultLocalEndpoint.port;
+        }
+        if (savedPath !== null && savedPath !== undefined && savedPath.trim().length > 0) {
+          this.path = savedPath;
+        } else {
+          this.path = defaultLocalEndpoint.path;
+        }
         if (savedSecureEndpoint && savedSecureEndpoint.trim().length > 0 && !savedSecureEndpoint.includes('192.168.')) {
           this.secureEndpoint = normalizeSecureRelayUrl(savedSecureEndpoint);
         } else {
@@ -420,7 +477,7 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
 
     if (proto === 'wss') {
       let ep = (this.secureEndpoint || ENV_SECURE_RELAY_URL || 'wss://vishal-done-backup.onrender.com/ws').trim();
-      let url = normalizeSecureRelayUrl(ep, formattedPath || '/ws');
+      let url = normalizeSecureRelayUrl(ep);
 
       // Append token if configured and not already included
       const tokenToUse = (this.relayToken || ENV_RELAY_TOKEN).trim();
@@ -432,7 +489,8 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
       return url;
     } else {
       // Direct WS to ESP32: Do NOT convert ws:// to wss://
-      return `ws://${this.localHost}:${this.localPort}${formattedPath}`;
+      const rawUrl = `ws://${this.localHost}:${this.localPort}${formattedPath || '/ws'}`;
+      return normalizeEsp32WsUrl(rawUrl, formattedPath || '/ws');
     }
   }
 
@@ -460,7 +518,7 @@ export class Esp32WebSocketTransport implements MavlinkTransport {
       this.path = options.path.trim();
     }
     if (options.secureEndpoint !== undefined) {
-      this.secureEndpoint = normalizeSecureRelayUrl(options.secureEndpoint.trim(), this.path || '/ws');
+      this.secureEndpoint = normalizeSecureRelayUrl(options.secureEndpoint.trim());
     }
     if (options.relayToken !== undefined) {
       this.relayToken = options.relayToken.trim();

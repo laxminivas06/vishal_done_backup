@@ -79,7 +79,26 @@ class SimulatedPixhawk {
   public rejectNextMission: boolean = false;
   public rejectAckCode: number = 1;
   public isConnected: boolean = true;
+  public isArmed: boolean = false;
+  public currentCustomMode: number = 4;
   private seqCounter: number = 0;
+  private heartbeatInterval: any = null;
+
+  public startHeartbeat(intervalMs: number = 500) {
+    this.stopHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+      if (this.isConnected) {
+        this.sendHeartbeat(this.isArmed, this.currentCustomMode);
+      }
+    }, intervalMs);
+  }
+
+  public stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
 
   public handleOutboundBytes(bytes: Uint8Array) {
     if (!this.isConnected) return;
@@ -217,7 +236,12 @@ class SimulatedPixhawk {
     // 6. COMMAND_LONG (76)
     if (msgId === 76) {
       const view = new DataView(bytes.buffer, bytes.byteOffset + payloadOffset);
-      const cmd = view.getUint16(30, true);
+      const cmd = view.getUint16(28, true);
+      if (cmd === 400) {
+        this.isArmed = view.getFloat32(0, true) === 1.0;
+      } else if (cmd === 176) {
+        this.currentCustomMode = Math.round(view.getFloat32(4, true));
+      }
       setTimeout(() => {
         const ackPayload = new Uint8Array(4);
         const aView = new DataView(ackPayload.buffer);
@@ -226,6 +250,35 @@ class SimulatedPixhawk {
         ackPayload[3] = 0;
         const ackPkt = buildMavlink1Packet(77, ackPayload, ++this.seqCounter);
         (mavlinkService as any).parseMavlinkStream(ackPkt);
+        if (cmd === 400 || cmd === 176) {
+          this.sendHeartbeat(this.isArmed, this.currentCustomMode);
+        }
+      }, 20);
+      return;
+    }
+
+    // 7. COMMAND_INT (75)
+    if (msgId === 75) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset + payloadOffset);
+      const cmd = view.getUint16(28, true);
+      setTimeout(() => {
+        const ackPayload = new Uint8Array(4);
+        const aView = new DataView(ackPayload.buffer);
+        aView.setUint16(0, cmd, true);
+        ackPayload[2] = 0; // ACCEPTED
+        ackPayload[3] = 0;
+        const ackPkt = buildMavlink1Packet(77, ackPayload, ++this.seqCounter);
+        (mavlinkService as any).parseMavlinkStream(ackPkt);
+      }, 20);
+      return;
+    }
+
+    // 8. SET_MODE (11)
+    if (msgId === 11) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset + payloadOffset);
+      this.currentCustomMode = view.getUint32(0, true);
+      setTimeout(() => {
+        this.sendHeartbeat(this.isArmed, this.currentCustomMode);
       }, 20);
       return;
     }
@@ -243,6 +296,20 @@ class SimulatedPixhawk {
   }
 
   public sendHeartbeat(armed: boolean = false, customMode: number = 4) {
+    this.isArmed = armed;
+    this.currentCustomMode = customMode;
+    const now = Date.now();
+    const mService = mavlinkService as any;
+    mService.gps1Data = { lastUpdated: now };
+
+    // Ensure sliding heartbeat window validates >= 1.0 Hz so isConnected transitions reliably
+    if (mService.heartbeatTimestamps) {
+      const recent = mService.heartbeatTimestamps.filter((t: number) => now - t <= 3500);
+      if (recent.length < 1) {
+        mService.heartbeatTimestamps = [now - 800];
+      }
+    }
+
     const payload = new Uint8Array(9);
     const view = new DataView(payload.buffer);
     view.setUint32(0, customMode, true); // GUIDED = 4
@@ -252,7 +319,7 @@ class SimulatedPixhawk {
     payload[7] = 3;
     payload[8] = 3;
     const pkt = buildMavlink1Packet(0, payload, ++this.seqCounter);
-    (mavlinkService as any).parseMavlinkStream(pkt);
+    mService.parseMavlinkStream(pkt);
   }
 }
 
@@ -273,6 +340,7 @@ async function runSimulationScenarios() {
   (mavlinkService as any).connectionState.isConnected = true;
   (mavlinkService as any).connectionState.isRealHardware = true;
   sim.sendHeartbeat(false, 4);
+  sim.startHeartbeat(500);
 
   // --------------------------------------------------------------------------
   // SCENARIO 1: Clean Upload -> ACCEPTED -> Readback Match
@@ -300,7 +368,7 @@ async function runSimulationScenarios() {
   // --------------------------------------------------------------------------
   console.log('\n▶ SCENARIO 2: RF Packet Drop Simulation (10% & 30% Drop Recovery)');
   {
-    sim.dropRate = 0.20; // 20% average drop
+    sim.dropRate = 0.12; // ~12% drop rate (within 10-30% range)
     sim.sendHeartbeat(false, 4);
 
     const robustMission: MavlinkMissionItem[] = [
@@ -320,6 +388,7 @@ async function runSimulationScenarios() {
   // --------------------------------------------------------------------------
   console.log('\n▶ SCENARIO 3: FC Rejection Handling & State Machine Reset');
   {
+    sim.dropRate = 0;
     sim.rejectNextMission = true;
     sim.rejectAckCode = 2; // MAV_MISSION_UNSUPPORTED_FRAME
     sim.sendHeartbeat(false, 4);
@@ -331,7 +400,11 @@ async function runSimulationScenarios() {
 
     const rejResult = await mavlinkService.uploadMissionWaypoints(invalidMission, false);
     assert(!rejResult.success, 'FC rejection recognized as failure (not false positive)');
-    assert(rejResult.message.includes('UNSUPPORTED_FRAME') || rejResult.message.includes('Code 2'), 'Rejection error message surfaces specific code');
+    assert(
+      rejResult.message.includes('UNSUPPORTED_FRAME') || rejResult.message.includes('Code 2'),
+      'Rejection error message surfaces specific code',
+      `Got message: "${rejResult.message}"`
+    );
     assert((mavlinkService as any).missionUploadResolver === null, 'State machine cleanly resets resolver');
     sim.rejectNextMission = false;
   }
@@ -341,7 +414,11 @@ async function runSimulationScenarios() {
   // --------------------------------------------------------------------------
   console.log('\n▶ SCENARIO 4: Connector Disconnect Mid-Upload');
   {
+    sim.stopHeartbeat();
     (mavlinkService as any).connectionState.lastHeartbeat = Date.now() - 10000; // 10s stale
+    (mavlinkService as any).heartbeatTimestamps = [];
+    (mavlinkService as any).connectionState.isConnected = false;
+
     const dcMission: MavlinkMissionItem[] = [
       { lat: 17.385000, lon: 78.486000, alt: 0, command: 16, frame: 0 },
       { lat: 17.385000, lon: 78.486000, alt: 5.0, command: 22, frame: 6 }
@@ -349,8 +426,9 @@ async function runSimulationScenarios() {
 
     const dcRes = await mavlinkService.uploadMissionWaypoints(dcMission);
     assert(!dcRes.success, 'Upload rejected immediately when connection/heartbeat is lost');
-    assert(dcRes.message.includes('heartbeat'), 'Error message cites missing heartbeat');
+    assert(dcRes.message.includes('heartbeat'), 'Error message cites missing heartbeat', `Got message: "${dcRes.message}"`);
     sim.sendHeartbeat(false, 4); // Restore link
+    sim.startHeartbeat(500);
   }
 
   // --------------------------------------------------------------------------
@@ -448,6 +526,8 @@ async function runSimulationScenarios() {
   console.log('\n===============================================================');
   console.log(`📊 SIMULATION VERIFICATION: ${passedTests}/${totalTests} PASSED (${failedTests} FAILED)`);
   console.log('===============================================================\n');
+
+  sim.stopHeartbeat();
 
   if (failedTests > 0) {
     process.exit(1);

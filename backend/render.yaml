@@ -5,8 +5,13 @@ services:
     plan: free
     buildCommand: npm install
     startCommand: npm start
+    healthCheckPath: /health
     envVars:
       - key: PORT
         value: 10000
       - key: RELAY_TOKEN
-        generateValue: true
+        value: saeindia_sec_99348a7b1c0e
+      - key: NODE_ENV
+        value: production
+      - key: KEEP_ALIVE_URL
+        value: https://vishal-done-backup.onrender.com

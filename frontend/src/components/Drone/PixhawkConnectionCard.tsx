@@ -38,7 +38,7 @@ import {
   Trash2
 } from 'lucide-react';
 import { SerialDiagnosticsModal } from './SerialDiagnosticsModal';
-import { normalizeSecureRelayUrl } from '../../services/transports/Esp32WebSocketTransport';
+import { normalizeSecureRelayUrl, normalizeEsp32WsUrl, parseWsEndpoint } from '../../services/transports/Esp32WebSocketTransport';
 
 interface PixhawkConnectionCardProps {
   connectionState: PixhawkConnectionState;
@@ -91,27 +91,32 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
     return 'WSS';
   });
 
+  // Default direct ESP32 WebSocket settings parsed from VITE_ESP32_WS_URL
+  const defaultWs = parseWsEndpoint(
+    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_ESP32_WS_URL) || 'ws://192.168.31.194:8080/ws'
+  );
+
   // Local ESP32 IP, Port & Path settings
   const [esp32Host, setEsp32Host] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('esp32_host');
       if (saved && saved.trim().length > 0) return saved.trim();
     }
-    return '192.168.31.194';
+    return defaultWs.host;
   });
   const [esp32Port, setEsp32Port] = useState<number>(() => {
     if (typeof window !== 'undefined') {
       const p = localStorage.getItem('esp32_port');
-      return p ? parseInt(p, 10) || 8080 : 8080;
+      return p ? parseInt(p, 10) || defaultWs.port : defaultWs.port;
     }
-    return 8080;
+    return defaultWs.port;
   });
   const [esp32Path, setEsp32Path] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       const p = localStorage.getItem('esp32_path');
-      return p !== null ? p : '/ws';
+      return p !== null ? p : defaultWs.path;
     }
-    return '/ws';
+    return defaultWs.path;
   });
 
   // Secure Endpoint / Relay URL settings (WSS Mode)
@@ -132,7 +137,7 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
       const saved = localStorage.getItem('esp32_relay_token');
       if (saved && saved.trim().length > 0 && saved !== 'saeindia_secret_token_2026' && saved !== 'CHANGE_ME') return saved.trim();
     }
-    return (typeof import.meta !== 'undefined' && import.meta.env?.VITE_RELAY_TOKEN) || '';
+    return (typeof import.meta !== 'undefined' && import.meta.env?.VITE_RELAY_TOKEN) || 'saeindia_sec_99348a7b1c0e';
   });
 
   // Mobile collapsed toggle
@@ -154,13 +159,13 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
   const esp32Mode: 'LOCAL' | 'SECURE' = isHttpsOrigin || protocolMode === 'WSS' ? 'SECURE' : 'LOCAL';
   const cleanPath = esp32Path ? (esp32Path.startsWith('/') ? esp32Path : `/${esp32Path}`) : '/ws';
   const effectiveProto = esp32Mode === 'SECURE' ? 'wss' : 'ws';
-  const normalizedSecureEp = normalizeSecureRelayUrl(esp32SecureEndpoint, cleanPath);
+  const normalizedSecureEp = normalizeSecureRelayUrl(esp32SecureEndpoint);
   const targetHost = (esp32Mode === 'SECURE') 
     ? normalizedSecureEp.replace(/^(wss?:\/\/|https?:\/\/)+/i, '').replace(/\/+$/, '') 
     : `${esp32Host}:${esp32Port}`;
   const resolvedTargetUrl = (esp32Mode === 'SECURE')
     ? normalizedSecureEp
-    : `${effectiveProto}://${targetHost}${cleanPath}`;
+    : normalizeEsp32WsUrl(`${effectiveProto}://${targetHost}${cleanPath}`);
 
   // Five Clear Connection States
   const linkState: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING' | 'ERROR' = (() => {
@@ -253,7 +258,7 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
         localStorage.setItem('esp32_host', esp32Host.trim());
         localStorage.setItem('esp32_port', esp32Port.toString());
         localStorage.setItem('esp32_path', esp32Path.trim());
-        const cleanSecureEndpoint = normalizeSecureRelayUrl(esp32SecureEndpoint, esp32Path || '/ws');
+        const cleanSecureEndpoint = normalizeSecureRelayUrl(esp32SecureEndpoint);
         setEsp32SecureEndpoint(cleanSecureEndpoint);
         localStorage.setItem('esp32_secure_endpoint', cleanSecureEndpoint);
         localStorage.setItem('esp32_relay_token', esp32RelayToken.trim());
@@ -268,7 +273,7 @@ export const PixhawkConnectionCard: React.FC<PixhawkConnectionCardProps> = ({
         host: esp32Host.trim(),
         port: esp32Port,
         path: esp32Path.trim(),
-        secureEndpoint: normalizeSecureRelayUrl(esp32SecureEndpoint, esp32Path || '/ws'),
+        secureEndpoint: normalizeSecureRelayUrl(esp32SecureEndpoint),
         relayToken: esp32RelayToken.trim(),
         protocol: effectiveProto,
         baudRate: selectedBaud,

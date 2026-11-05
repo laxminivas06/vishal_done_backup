@@ -25,15 +25,15 @@ if (fs.existsSync(envPath)) {
 const ESP32_HOST = process.env.ESP32_HOST || '192.168.31.194';
 const ESP32_PORT = process.env.ESP32_PORT || '8080';
 const ESP32_PATH = process.env.ESP32_PATH || '/ws';
-const RELAY_URL = process.env.RELAY_URL || 'ws://localhost:8443/connector';
-const RELAY_TOKEN = process.env.RELAY_TOKEN || 'saeindia_secret_token_2026';
+const RELAY_URL = process.env.RELAY_URL || 'wss://vishal-done-backup.onrender.com/connector';
+const RELAY_TOKEN = process.env.RELAY_TOKEN || 'saeindia_sec_99348a7b1c0e';
 
 const cleanPath = ESP32_PATH.startsWith('/') ? ESP32_PATH : `/${ESP32_PATH}`;
 const esp32WsUrl = `ws://${ESP32_HOST}:${ESP32_PORT}${cleanPath}`;
 
 // Determine final relay URL with token query param
 let targetRelayUrl = RELAY_URL;
-if (RELAY_TOKEN) {
+if (RELAY_TOKEN && !targetRelayUrl.includes('token=')) {
   const separator = targetRelayUrl.includes('?') ? '&' : '?';
   targetRelayUrl = `${targetRelayUrl}${separator}token=${encodeURIComponent(RELAY_TOKEN)}`;
 }

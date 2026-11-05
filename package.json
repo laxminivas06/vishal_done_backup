@@ -22,7 +22,8 @@
     "test": "npx tsx tests/test-all-systems.ts",
     "test:sitl": "npx tsx tests/test-sitl-scenarios.ts",
     "test:smoke": "npx tsx tests/test-backend-smoke.ts",
-    "test:all": "npx tsx tests/test-all-systems.ts && npx tsx tests/test-sitl-scenarios.ts && npx tsx tests/test-backend-smoke.ts",
+    "test:url": "npx tsx tests/test-url-normalization.ts",
+    "test:all": "npx tsx tests/test-all-systems.ts && npx tsx tests/test-sitl-scenarios.ts && npx tsx tests/test-backend-smoke.ts && npx tsx tests/test-url-normalization.ts",
     "test:e2e": "node test-e2e.cjs"
   },
   "dependencies": {
@@ -46,7 +47,7 @@
     "tailwind-merge": "^2.5.2",
     "typescript": "^5.5.3",
     "vite": "^5.4.2",
-    "ws": "^8.21.3"
+    "ws": "^8.22.1"
   },
   "devDependencies": {
     "@vitejs/plugin-basic-ssl": "^1.2.0",
